@@ -7,10 +7,10 @@ from aiogram.types import Message
 from aiohttp import web
 
 # === НАСТРОЙКИ (Берем из "секретов" Render) ===
-TOKEN = os.getenv("8509662585:AAErQX0z1mvVj20npoqfFtuKRnzShBlUq0U")
+TOKEN = os.getenv("BOT_TOKEN")
 # ID канала должен быть числом (например -100123456789)
 try:
-    CHANNEL_ID = int(os.getenv("-1003603094158"))
+    CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 except:
     CHANNEL_ID = 0 # Заглушка, если забыл добавить ID
 # =============================================
