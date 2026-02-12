@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: telegram-bot
+    name: file-bot
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
