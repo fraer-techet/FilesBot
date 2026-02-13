@@ -1,10 +1,13 @@
 import os
 import uuid
+import asyncio
 import logging
 from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.enums import ContentType
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 from aiogram.webhook.aiohttp_server import (
     SimpleRequestHandler,
     setup_application,
@@ -22,16 +25,25 @@ SUPA_KEY = os.environ["SUPABASE_KEY"]
 WH_PATH  = f"/wh/{TOKEN}"
 PORT     = int(os.environ.get("PORT", 10000))
 
-TABLE = f"{SUPA_URL}/rest/v1/files"
+FILES_TABLE = f"{SUPA_URL}/rest/v1/files"
+USERS_TABLE = f"{SUPA_URL}/rest/v1/users"
 
 http: ClientSession = None
 
+
 # ══════════════════════════════════════════════
-#  БАЗА ДАННЫХ — Supabase REST API
+#  СОСТОЯНИЯ (FSM)
+# ══════════════════════════════════════════════
+class BroadcastState(StatesGroup):
+    waiting_message = State()
+
+
+# ══════════════════════════════════════════════
+#  БАЗА ДАННЫХ — файлы
 # ══════════════════════════════════════════════
 async def db_get(code: str):
     async with http.get(
-        f"{TABLE}?code=eq.{code}&select=*"
+        f"{FILES_TABLE}?code=eq.{code}&select=*"
     ) as r:
         data = await r.json()
         return data[0] if data else None
@@ -41,7 +53,7 @@ async def db_save(code: str, entry: dict):
     row = {"code": code}
     row.update(entry)
     async with http.post(
-        TABLE,
+        FILES_TABLE,
         json=row,
         headers={"Prefer": "return=minimal"}
     ) as r:
@@ -51,23 +63,77 @@ async def db_save(code: str, entry: dict):
 
 
 async def db_delete(code: str):
-    async with http.delete(f"{TABLE}?code=eq.{code}") as r:
+    async with http.delete(
+        f"{FILES_TABLE}?code=eq.{code}"
+    ) as r:
         pass
 
 
 async def db_all():
     async with http.get(
-        f"{TABLE}?select=*&order=created_at.desc"
+        f"{FILES_TABLE}?select=*&order=created_at.desc"
     ) as r:
         return await r.json()
 
 
 async def db_increment(code: str, current: int):
     async with http.patch(
-        f"{TABLE}?code=eq.{code}",
+        f"{FILES_TABLE}?code=eq.{code}",
         json={"downloads": current + 1}
     ) as r:
         pass
+
+
+# ══════════════════════════════════════════════
+#  БАЗА ДАННЫХ — пользователи
+# ══════════════════════════════════════════════
+async def save_user(user: types.User):
+    """Сохраняет пользователя. Если уже есть — обновляет имя."""
+    async with http.post(
+        USERS_TABLE,
+        json={
+            "user_id": user.id,
+            "username": user.username or "",
+            "first_name": user.first_name or "",
+        },
+        headers={
+            "Prefer": "return=minimal",
+            "on-conflict": "user_id",
+        }
+    ) as r:
+        # если уже существует — обновляем
+        if r.status == 409:
+            async with http.patch(
+                f"{USERS_TABLE}?user_id=eq.{user.id}",
+                json={
+                    "username": user.username or "",
+                    "first_name": user.first_name or "",
+                }
+            ) as r2:
+                pass
+
+
+async def get_all_users():
+    """Все user_id из базы."""
+    async with http.get(
+        f"{USERS_TABLE}?select=user_id"
+    ) as r:
+        rows = await r.json()
+        return [row["user_id"] for row in rows]
+
+
+async def count_users():
+    async with http.get(
+        f"{USERS_TABLE}?select=user_id",
+        headers={"Prefer": "count=exact"}
+    ) as r:
+        # Supabase возвращает count в заголовке
+        content_range = r.headers.get("content-range", "")
+        try:
+            return int(content_range.split("/")[1])
+        except Exception:
+            data = await r.json()
+            return len(data)
 
 
 # ══════════════════════════════════════════════
@@ -86,8 +152,14 @@ MEDIA_TYPES = {
 NO_CAPTION = {"video_note", "sticker"}
 
 
+# ────────── /start + deep-link ──────────
 @router.message(CommandStart())
-async def cmd_start(msg: types.Message):
+async def cmd_start(msg: types.Message, state: FSMContext):
+    # Сохраняем пользователя
+    await save_user(msg.from_user)
+    # Сбрасываем состояние
+    await state.clear()
+
     args = msg.text.split(maxsplit=1)
 
     if len(args) > 1:
@@ -114,14 +186,19 @@ async def cmd_start(msg: types.Message):
         return
 
     if msg.from_user.id == OWNER_ID:
+        users = await count_users()
         rows = await db_all()
         await msg.answer(
             f"👑 <b>Вы владелец</b>\n\n"
-            f"📂 Файлов: <b>{len(rows)}</b>\n\n"
+            f"📂 Файлов: <b>{len(rows)}</b>\n"
+            f"👥 Пользователей: <b>{users}</b>\n\n"
             f"Отправьте файл → получите ссылку\n\n"
+            f"<b>Команды:</b>\n"
             f"/list — все файлы\n"
             f"/del <code>код</code> — удалить\n"
-            f"/stats — статистика",
+            f"/stats — статистика\n"
+            f"/send — рассылка всем\n"
+            f"/cancel — отменить рассылку",
             parse_mode="HTML",
         )
     else:
@@ -130,11 +207,118 @@ async def cmd_start(msg: types.Message):
         )
 
 
+# ══════════════════════════════════════════════
+#  РАССЫЛКА
+# ══════════════════════════════════════════════
+
+# ────────── /send — начать рассылку ──────────
+@router.message(Command("send"), F.from_user.id == OWNER_ID)
+async def cmd_send(msg: types.Message, state: FSMContext):
+    users = await count_users()
+    await state.set_state(BroadcastState.waiting_message)
+    await msg.answer(
+        f"📢 <b>Режим рассылки</b>\n\n"
+        f"👥 Получателей: <b>{users}</b>\n\n"
+        f"Отправьте сообщение которое получат ВСЕ пользователи.\n"
+        f"Можно отправить:\n"
+        f"• Текст\n"
+        f"• Фото с подписью\n"
+        f"• Видео\n"
+        f"• Документ\n"
+        f"• Голосовое\n"
+        f"• Что угодно!\n\n"
+        f"/cancel — отменить",
+        parse_mode="HTML",
+    )
+
+
+# ────────── /cancel — отменить рассылку ──────────
+@router.message(Command("cancel"), F.from_user.id == OWNER_ID)
+async def cmd_cancel(msg: types.Message, state: FSMContext):
+    current = await state.get_state()
+    if current:
+        await state.clear()
+        await msg.answer("❌ Рассылка отменена.")
+    else:
+        await msg.answer("Нечего отменять.")
+
+
+# ────────── Получаем сообщение для рассылки ──────────
+@router.message(
+    BroadcastState.waiting_message,
+    F.from_user.id == OWNER_ID,
+)
+async def do_broadcast(msg: types.Message, state: FSMContext):
+    await state.clear()
+
+    user_ids = await get_all_users()
+    total = len(user_ids)
+
+    if total == 0:
+        return await msg.answer("👥 Нет пользователей.")
+
+    status = await msg.answer(
+        f"📢 Рассылка началась...\n"
+        f"👥 Получателей: {total}\n\n"
+        f"⏳ Ждите..."
+    )
+
+    sent = 0
+    failed = 0
+    blocked = 0
+
+    for uid in user_ids:
+        try:
+            await msg.copy_to(chat_id=uid)
+            sent += 1
+        except Exception as e:
+            err = str(e).lower()
+            if "blocked" in err or "deactivated" in err:
+                blocked += 1
+            else:
+                failed += 1
+            logging.warning(f"Broadcast to {uid}: {e}")
+
+        # Telegram лимит: 30 сообщений/сек
+        # Делаем паузу каждые 25 сообщений
+        if (sent + failed + blocked) % 25 == 0:
+            await asyncio.sleep(1)
+
+        # Обновляем статус каждые 50 сообщений
+        if (sent + failed + blocked) % 50 == 0:
+            try:
+                await status.edit_text(
+                    f"📢 Рассылка...\n"
+                    f"✅ {sent} · ❌ {failed} · 🚫 {blocked}\n"
+                    f"Осталось: {total - sent - failed - blocked}"
+                )
+            except Exception:
+                pass
+
+    await status.edit_text(
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"👥 Всего: <b>{total}</b>\n"
+        f"✅ Доставлено: <b>{sent}</b>\n"
+        f"🚫 Заблокировали бота: <b>{blocked}</b>\n"
+        f"❌ Ошибки: <b>{failed}</b>",
+        parse_mode="HTML",
+    )
+
+
+# ══════════════════════════════════════════════
+#  ФАЙЛЫ (без изменений)
+# ══════════════════════════════════════════════
+
 @router.message(
     F.from_user.id == OWNER_ID,
     F.content_type.in_(MEDIA_TYPES),
 )
-async def save_file(msg: types.Message):
+async def save_file(msg: types.Message, state: FSMContext):
+    # Проверяем что мы НЕ в режиме рассылки
+    current = await state.get_state()
+    if current == BroadcastState.waiting_message:
+        return  # обработается в do_broadcast
+
     code = uuid.uuid4().hex[:8]
     entry = {"caption": msg.caption or "", "downloads": 0}
 
@@ -230,6 +414,7 @@ async def cmd_del(msg: types.Message):
 @router.message(Command("stats"), F.from_user.id == OWNER_ID)
 async def cmd_stats(msg: types.Message):
     rows = await db_all()
+    users = await count_users()
     total = len(rows)
     dl = sum(e.get("downloads", 0) for e in rows)
     top = sorted(rows, key=lambda x: x.get("downloads", 0),
@@ -241,6 +426,7 @@ async def cmd_stats(msg: types.Message):
     text = (
         f"📊 <b>Статистика</b>\n\n"
         f"📁 Файлов: <b>{total}</b>\n"
+        f"👥 Пользователей: <b>{users}</b>\n"
         f"📥 Скачиваний: <b>{dl}</b>"
     )
     if t:
@@ -251,16 +437,22 @@ async def cmd_stats(msg: types.Message):
 @router.message()
 async def fallback(msg: types.Message):
     if msg.from_user.id == OWNER_ID:
-        await msg.answer("📤 Отправьте файл.\n/list — файлы")
+        await msg.answer(
+            "📤 Отправьте файл.\n"
+            "/list — файлы\n"
+            "/send — рассылка"
+        )
     else:
-        await msg.answer("Перейдите по ссылке от отправителя.")
+        await msg.answer(
+            "Перейдите по ссылке от отправителя."
+        )
 
 
 dp.include_router(router)
 
 
 # ══════════════════════════════════════════════
-#  ЗАПУСК — webhook
+#  ЗАПУСК
 # ══════════════════════════════════════════════
 async def on_startup(**kwargs):
     global http
