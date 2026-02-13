@@ -13,61 +13,61 @@ from aiogram.webhook.aiohttp_server import (
 # ══════════════════════════════════════════════
 #  НАСТРОЙКИ
 # ══════════════════════════════════════════════
-TOKEN        = os.environ["BOT_TOKEN"]
-OWNER_ID     = int(os.environ["OWNER_ID"])
-BOT_USER     = os.environ["BOT_USERNAME"]
-BASE_URL     = os.environ.get("RENDER_EXTERNAL_URL", "")
-SUPA_URL     = os.environ["SUPABASE_URL"]
-SUPA_KEY     = os.environ["SUPABASE_KEY"]
-WH_PATH      = f"/wh/{TOKEN}"
-PORT         = int(os.environ.get("PORT", 10000))
+TOKEN    = os.environ["BOT_TOKEN"]
+OWNER_ID = int(os.environ["OWNER_ID"])
+BOT_USER = os.environ["BOT_USERNAME"]
+BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+SUPA_URL = os.environ["SUPABASE_URL"]
+SUPA_KEY = os.environ["SUPABASE_KEY"]
+WH_PATH  = f"/wh/{TOKEN}"
+PORT     = int(os.environ.get("PORT", 10000))
 
 TABLE = f"{SUPA_URL}/rest/v1/files"
 
-# глобальная HTTP-сессия для Supabase
-http = None
+http: ClientSession = None
 
 # ══════════════════════════════════════════════
-#  ФУНКЦИИ БАЗЫ ДАННЫХ (Supabase REST API)
+#  БАЗА ДАННЫХ — Supabase REST API
 # ══════════════════════════════════════════════
-
-async def db_get(code):
-    """Получить один файл по коду."""
+async def db_get(code: str):
     async with http.get(
         f"{TABLE}?code=eq.{code}&select=*"
     ) as r:
-        rows = await r.json()
-        return rows[0] if rows else None
+        data = await r.json()
+        return data[0] if data else None
 
 
-async def db_save(code, entry):
-    """Сохранить новый файл."""
-    await http.post(
+async def db_save(code: str, entry: dict):
+    row = {"code": code}
+    row.update(entry)
+    async with http.post(
         TABLE,
-        json={"code": code, **entry},
-        headers={"Prefer": "return=minimal"},
-    )
+        json=row,
+        headers={"Prefer": "return=minimal"}
+    ) as r:
+        if r.status >= 400:
+            text = await r.text()
+            logging.error(f"DB save error: {r.status} {text}")
 
 
-async def db_delete(code):
-    """Удалить файл."""
-    await http.delete(f"{TABLE}?code=eq.{code}")
+async def db_delete(code: str):
+    async with http.delete(f"{TABLE}?code=eq.{code}") as r:
+        pass
 
 
 async def db_all():
-    """Все файлы (новые первые)."""
     async with http.get(
         f"{TABLE}?select=*&order=created_at.desc"
     ) as r:
         return await r.json()
 
 
-async def db_increment(code, current):
-    """Увеличить счётчик скачиваний."""
-    await http.patch(
+async def db_increment(code: str, current: int):
+    async with http.patch(
         f"{TABLE}?code=eq.{code}",
-        json={"downloads": current + 1},
-    )
+        json={"downloads": current + 1}
+    ) as r:
+        pass
 
 
 # ══════════════════════════════════════════════
@@ -86,18 +86,15 @@ MEDIA_TYPES = {
 NO_CAPTION = {"video_note", "sticker"}
 
 
-# ────────── /start + deep-link ──────────
 @router.message(CommandStart())
 async def cmd_start(msg: types.Message):
     args = msg.text.split(maxsplit=1)
 
-    # Если есть код файла → отдаём файл
     if len(args) > 1:
         code = args[1]
         entry = await db_get(code)
-
         if not entry:
-            return await msg.answer("❌ Файл не найден или ссылка устарела.")
+            return await msg.answer("❌ Файл не найден.")
 
         await db_increment(code, entry.get("downloads", 0))
 
@@ -116,14 +113,12 @@ async def cmd_start(msg: types.Message):
             await msg.answer("❌ Не удалось отправить файл.")
         return
 
-    # Обычный /start
     if msg.from_user.id == OWNER_ID:
         rows = await db_all()
         await msg.answer(
             f"👑 <b>Вы владелец</b>\n\n"
-            f"📂 Файлов в базе: <b>{len(rows)}</b>\n\n"
+            f"📂 Файлов: <b>{len(rows)}</b>\n\n"
             f"Отправьте файл → получите ссылку\n\n"
-            f"<b>Команды:</b>\n"
             f"/list — все файлы\n"
             f"/del <code>код</code> — удалить\n"
             f"/stats — статистика",
@@ -131,12 +126,10 @@ async def cmd_start(msg: types.Message):
         )
     else:
         await msg.answer(
-            "👋 Привет! Перейдите по ссылке от отправителя, "
-            "чтобы получить файл."
+            "👋 Привет! Перейдите по ссылке от отправителя."
         )
 
 
-# ────────── Владелец отправляет файл ──────────
 @router.message(
     F.from_user.id == OWNER_ID,
     F.content_type.in_(MEDIA_TYPES),
@@ -147,13 +140,16 @@ async def save_file(msg: types.Message):
 
     extractors = [
         (msg.document,   "document",   lambda: (
-            msg.document.file_id, msg.document.file_name or "file")),
+            msg.document.file_id,
+            msg.document.file_name or "file")),
         (msg.photo,      "photo",      lambda: (
             msg.photo[-1].file_id, "photo.jpg")),
         (msg.video,      "video",      lambda: (
-            msg.video.file_id, msg.video.file_name or "video.mp4")),
+            msg.video.file_id,
+            msg.video.file_name or "video.mp4")),
         (msg.audio,      "audio",      lambda: (
-            msg.audio.file_id, msg.audio.file_name or "audio.mp3")),
+            msg.audio.file_id,
+            msg.audio.file_name or "audio.mp3")),
         (msg.voice,      "voice",      lambda: (
             msg.voice.file_id, "voice.ogg")),
         (msg.video_note, "video_note", lambda: (
@@ -182,7 +178,6 @@ async def save_file(msg: types.Message):
     )
 
 
-# ────────── Чужой пытается загрузить ──────────
 @router.message(
     F.from_user.id != OWNER_ID,
     F.content_type.in_(MEDIA_TYPES),
@@ -191,7 +186,6 @@ async def reject(msg: types.Message):
     await msg.answer("⛔ Только владелец может добавлять файлы.")
 
 
-# ────────── /list ──────────
 @router.message(Command("list"), F.from_user.id == OWNER_ID)
 async def cmd_list(msg: types.Message):
     rows = await db_all()
@@ -202,21 +196,19 @@ async def cmd_list(msg: types.Message):
     for e in rows:
         link = f"https://t.me/{BOT_USER}?start={e['code']}"
         lines.append(
-            f"📁 <b>{e.get('name','?')}</b>  "
-            f"📥 {e.get('downloads',0)}\n"
-            f"   <code>{e['code']}</code> · {link}"
+            f"📁 <b>{e.get('name','?')}</b> "
+            f"📥{e.get('downloads',0)}\n"
+            f"   <code>{e['code']}</code>\n   {link}"
         )
     text = "\n\n".join(lines)
-
     for i in range(0, len(text), 4000):
         await msg.answer(
-            text[i:i + 4000],
+            text[i:i+4000],
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
 
 
-# ────────── /del ──────────
 @router.message(Command("del"), F.from_user.id == OWNER_ID)
 async def cmd_del(msg: types.Message):
     parts = msg.text.split(maxsplit=1)
@@ -235,65 +227,60 @@ async def cmd_del(msg: types.Message):
     )
 
 
-# ────────── /stats ──────────
 @router.message(Command("stats"), F.from_user.id == OWNER_ID)
 async def cmd_stats(msg: types.Message):
     rows = await db_all()
     total = len(rows)
     dl = sum(e.get("downloads", 0) for e in rows)
-    top = sorted(
-        rows, key=lambda x: x.get("downloads", 0), reverse=True
-    )[:5]
+    top = sorted(rows, key=lambda x: x.get("downloads", 0),
+                 reverse=True)[:5]
     t = "\n".join(
         f"  📁 {e.get('name','?')} — {e.get('downloads',0)}"
         for e in top
     )
-    await msg.answer(
+    text = (
         f"📊 <b>Статистика</b>\n\n"
         f"📁 Файлов: <b>{total}</b>\n"
-        f"📥 Скачиваний: <b>{dl}</b>\n\n"
-        f"🔝 <b>Топ-5:</b>\n{t}" if t else
-        f"📊 Файлов: <b>{total}</b> · Скачиваний: <b>{dl}</b>",
-        parse_mode="HTML",
+        f"📥 Скачиваний: <b>{dl}</b>"
     )
+    if t:
+        text += f"\n\n🔝 <b>Топ-5:</b>\n{t}"
+    await msg.answer(text, parse_mode="HTML")
 
 
-# ────────── Всё остальное ──────────
 @router.message()
 async def fallback(msg: types.Message):
     if msg.from_user.id == OWNER_ID:
-        await msg.answer(
-            "📤 Отправьте файл для сохранения.\n/list — список"
-        )
+        await msg.answer("📤 Отправьте файл.\n/list — файлы")
     else:
-        await msg.answer(
-            "Перейдите по ссылке от отправителя."
-        )
+        await msg.answer("Перейдите по ссылке от отправителя.")
 
 
 dp.include_router(router)
 
 
 # ══════════════════════════════════════════════
-#  WEBHOOK + ЗАПУСК
+#  ЗАПУСК — webhook
 # ══════════════════════════════════════════════
-async def on_startup(bot_obj: Bot):
+async def on_startup(**kwargs):
     global http
     http = ClientSession(headers={
         "apikey": SUPA_KEY,
         "Authorization": f"Bearer {SUPA_KEY}",
         "Content-Type": "application/json",
     })
-    await bot_obj.set_webhook(f"{BASE_URL}{WH_PATH}")
-    logging.info("✅ Webhook set, Supabase connected")
+    await bot.set_webhook(f"{BASE_URL}{WH_PATH}")
+    logging.info("Webhook set, Supabase connected")
 
 
-async def on_shutdown(bot_obj: Bot):
+async def on_shutdown(**kwargs):
+    global http
     if http:
         await http.close()
+        http = None
 
 
-async def health(_request):
+async def health(_r):
     return web.Response(text="OK")
 
 
