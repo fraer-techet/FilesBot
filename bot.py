@@ -2,13 +2,17 @@ import os
 import uuid
 import asyncio
 import logging
-from aiohttp import ClientSession
+from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.enums import ContentType, ChatMemberStatus
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
+from aiogram.webhook.aiohttp_server import (
+    SimpleRequestHandler,
+    setup_application,
+)
 
 # ══════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -16,15 +20,16 @@ from aiogram.fsm.context import FSMContext
 TOKEN    = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 BOT_USER = os.environ["BOT_USERNAME"]
+BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 SUPA_URL = os.environ["SUPABASE_URL"]
 SUPA_KEY = os.environ["SUPABASE_KEY"]
+WH_PATH  = f"/wh/{TOKEN}"
+PORT     = int(os.environ.get("PORT", 10000))
 
 CHANNEL_ID   = os.environ.get("CHANNEL_ID", "")
 CHANNEL_LINK = "https://t.me/venoloadertgk"
 
 sub_required = True if CHANNEL_ID else False
-
-# Уведомления владельцу о загрузках админов (можно менять через /notify)
 notify_uploads = True
 
 FILES_TABLE  = f"{SUPA_URL}/rest/v1/files"
@@ -219,7 +224,7 @@ async def count_users():
 
 
 # ══════════════════════════════════════════════
-#  ОТПРАВКА ФАЙЛА
+#  ХЕЛПЕРЫ
 # ══════════════════════════════════════════════
 NO_CAPTION = {"video_note", "sticker"}
 
@@ -234,9 +239,6 @@ async def send_file(target, entry: dict):
     await send_method(entry["file_id"], **kw)
 
 
-# ══════════════════════════════════════════════
-#  ХЕЛПЕРЫ
-# ══════════════════════════════════════════════
 def get_username_display(user: types.User) -> str:
     if user.username:
         return f"@{user.username}"
@@ -244,12 +246,10 @@ def get_username_display(user: types.User) -> str:
 
 
 def can_manage(manager_role: int, target_role: int) -> bool:
-    """Может ли менеджер управлять целью."""
     return manager_role > target_role
 
 
 def can_delete_file(deleter_role: int, deleter_id: int, file_entry: dict) -> bool:
-    """Может ли пользователь удалить файл."""
     if deleter_role >= 4:
         return True
     file_owner = file_entry.get("uploaded_by", 0)
@@ -383,7 +383,6 @@ async def check_sub_callback(call: types.CallbackQuery):
 #  УПРАВЛЕНИЕ АДМИНАМИ
 # ══════════════════════════════════════════════
 
-# /setadmin <user_id> <senior/middle/junior>
 @router.message(Command("setadmin"))
 async def cmd_setadmin(msg: types.Message):
     caller_role = await get_role(msg.from_user.id)
@@ -413,17 +412,14 @@ async def cmd_setadmin(msg: types.Message):
     if target_id == OWNER_ID:
         return await msg.answer("⛔ Нельзя изменить роль владельца.")
 
-    # Проверяем: может ли назначить такую роль
     if new_role >= caller_role and caller_role < 4:
         return await msg.answer("⛔ Нельзя назначить роль равную или выше своей.")
 
-    # Получаем текущую роль цели
     target_current_role = await get_role(target_id)
 
     if target_current_role >= caller_role and caller_role < 4:
         return await msg.answer("⛔ Нельзя изменить админа с ролью равной или выше вашей.")
 
-    # Пробуем получить username
     try:
         chat = await bot.get_chat(target_id)
         username = chat.username or chat.first_name or str(target_id)
@@ -439,7 +435,6 @@ async def cmd_setadmin(msg: types.Message):
         parse_mode="HTML",
     )
 
-    # Уведомляем назначенного
     try:
         await bot.send_message(
             target_id,
@@ -451,7 +446,6 @@ async def cmd_setadmin(msg: types.Message):
         pass
 
 
-# /removeadmin <user_id>
 @router.message(Command("removeadmin"))
 async def cmd_removeadmin(msg: types.Message):
     caller_role = await get_role(msg.from_user.id)
@@ -484,7 +478,6 @@ async def cmd_removeadmin(msg: types.Message):
     if not can_manage(caller_role, target_role) and caller_role < 4:
         return await msg.answer("⛔ Нельзя снять админа с ролью равной или выше вашей.")
 
-    # Если не владелец — отправляем запрос владельцу
     if caller_role < 4:
         caller_name = get_username_display(msg.from_user)
         buttons = InlineKeyboardMarkup(inline_keyboard=[
@@ -512,7 +505,6 @@ async def cmd_removeadmin(msg: types.Message):
 
         return await msg.answer("📨 Запрос отправлен владельцу. Ожидайте решения.")
 
-    # Владелец снимает сразу
     await remove_admin(target_id)
     await msg.answer(
         f"✅ {ROLES[target_role]} {target_username} снят с должности.",
@@ -529,7 +521,6 @@ async def cmd_removeadmin(msg: types.Message):
         pass
 
 
-# /demote <user_id>
 @router.message(Command("demote"))
 async def cmd_demote(msg: types.Message):
     caller_role = await get_role(msg.from_user.id)
@@ -560,14 +551,13 @@ async def cmd_demote(msg: types.Message):
     target_username = target_info.get("username", str(target_id))
 
     if target_role <= 1:
-        return await msg.answer("❌ Админ уже на минимальной позиции. Используйте /removeadmin")
+        return await msg.answer("❌ Уже на минимальной позиции. Используйте /removeadmin")
 
     if not can_manage(caller_role, target_role) and caller_role < 4:
         return await msg.answer("⛔ Нельзя понизить админа с ролью равной или выше вашей.")
 
     new_role = target_role - 1
 
-    # Если не владелец — запрос владельцу
     if caller_role < 4:
         caller_name = get_username_display(msg.from_user)
         buttons = InlineKeyboardMarkup(inline_keyboard=[
@@ -596,7 +586,6 @@ async def cmd_demote(msg: types.Message):
 
         return await msg.answer("📨 Запрос отправлен владельцу. Ожидайте решения.")
 
-    # Владелец понижает сразу
     await set_admin(target_id, new_role, target_username)
     await msg.answer(
         f"✅ {target_username} понижен:\n"
@@ -614,7 +603,6 @@ async def cmd_demote(msg: types.Message):
         pass
 
 
-# /resign — снять админку с себя
 @router.message(Command("resign"))
 async def cmd_resign(msg: types.Message):
     role = await get_role(msg.from_user.id)
@@ -627,23 +615,20 @@ async def cmd_resign(msg: types.Message):
 
     await remove_admin(msg.from_user.id)
     await msg.answer(
-        f"✅ Вы сняли с себя роль {ROLES[role]}.\nТеперь вы обычный пользователь.",
+        f"✅ Вы сняли с себя роль {ROLES[role]}.",
         parse_mode="HTML",
     )
 
-    # Уведомляем владельца
     try:
         await bot.send_message(
             OWNER_ID,
-            f"ℹ️ {ROLES[role]} {get_username_display(msg.from_user)} "
-            f"снял с себя админку.",
+            f"ℹ️ {ROLES[role]} {get_username_display(msg.from_user)} снял с себя админку.",
             parse_mode="HTML",
         )
     except Exception:
         pass
 
 
-# /admins — список админов
 @router.message(Command("admins"))
 async def cmd_admins(msg: types.Message):
     role = await get_role(msg.from_user.id)
@@ -670,8 +655,6 @@ async def cmd_admins(msg: types.Message):
 # ══════════════════════════════════════════════
 #  CALLBACK — одобрение/отклонение
 # ══════════════════════════════════════════════
-
-# Снятие админа
 @router.callback_query(F.data.startswith("approve_remove:"))
 async def approve_remove(call: types.CallbackQuery):
     if call.from_user.id != OWNER_ID:
@@ -681,9 +664,7 @@ async def approve_remove(call: types.CallbackQuery):
     target_id = int(parts[1])
     requester_id = int(parts[2])
 
-    target_info = await get_admin_info(target_id)
-    if target_info:
-        await remove_admin(target_id)
+    await remove_admin(target_id)
 
     await call.message.edit_text(
         call.message.text + "\n\n✅ <b>ОДОБРЕНО</b>",
@@ -724,7 +705,6 @@ async def deny_remove(call: types.CallbackQuery):
     await call.answer("Отклонено!")
 
 
-# Понижение админа
 @router.callback_query(F.data.startswith("approve_demote:"))
 async def approve_demote(call: types.CallbackQuery):
     if call.from_user.id != OWNER_ID:
@@ -755,7 +735,7 @@ async def approve_demote(call: types.CallbackQuery):
         pass
 
     try:
-        await bot.send_message(requester_id, "✅ Ваш запрос на понижение админа одобрен владельцем.")
+        await bot.send_message(requester_id, "✅ Ваш запрос на понижение одобрен владельцем.")
     except Exception:
         pass
 
@@ -776,7 +756,7 @@ async def deny_demote(call: types.CallbackQuery):
     )
 
     try:
-        await bot.send_message(requester_id, "❌ Ваш запрос на понижение админа отклонён владельцем.")
+        await bot.send_message(requester_id, "❌ Ваш запрос на понижение отклонён владельцем.")
     except Exception:
         pass
 
@@ -784,7 +764,7 @@ async def deny_demote(call: types.CallbackQuery):
 
 
 # ══════════════════════════════════════════════
-#  ПЕРЕКЛЮЧАТЕЛИ (владелец)
+#  ПЕРЕКЛЮЧАТЕЛИ
 # ══════════════════════════════════════════════
 @router.message(Command("sub"))
 async def cmd_sub(msg: types.Message):
@@ -817,7 +797,7 @@ async def cmd_notify(msg: types.Message):
 
 
 # ══════════════════════════════════════════════
-#  РАССЫЛКА (только владелец)
+#  РАССЫЛКА
 # ══════════════════════════════════════════════
 @router.message(Command("send"))
 async def cmd_send(msg: types.Message, state: FSMContext):
@@ -941,7 +921,6 @@ async def save_file_handler(msg: types.Message, state: FSMContext):
         parse_mode="HTML",
     )
 
-    # Уведомление владельцу
     if notify_uploads and msg.from_user.id != OWNER_ID:
         try:
             await bot.send_message(
@@ -957,7 +936,6 @@ async def save_file_handler(msg: types.Message, state: FSMContext):
             pass
 
 
-# /myfiles — мои файлы
 @router.message(Command("myfiles"))
 async def cmd_myfiles(msg: types.Message):
     role = await get_role(msg.from_user.id)
@@ -982,7 +960,6 @@ async def cmd_myfiles(msg: types.Message):
         await msg.answer(text[i:i+4000], parse_mode="HTML", disable_web_page_preview=True)
 
 
-# /list — все файлы
 @router.message(Command("list"))
 async def cmd_list(msg: types.Message):
     role = await get_role(msg.from_user.id)
@@ -1008,7 +985,6 @@ async def cmd_list(msg: types.Message):
         await msg.answer(text[i:i+4000], parse_mode="HTML", disable_web_page_preview=True)
 
 
-# /del <код>
 @router.message(Command("del"))
 async def cmd_del(msg: types.Message):
     role = await get_role(msg.from_user.id)
@@ -1035,7 +1011,6 @@ async def cmd_del(msg: types.Message):
     )
 
 
-# /stats
 @router.message(Command("stats"))
 async def cmd_stats(msg: types.Message):
     role = await get_role(msg.from_user.id)
@@ -1068,7 +1043,6 @@ async def cmd_stats(msg: types.Message):
     await msg.answer(text, parse_mode="HTML")
 
 
-# Fallback
 @router.message()
 async def fallback(msg: types.Message):
     role = await get_role(msg.from_user.id)
@@ -1082,31 +1056,49 @@ dp.include_router(router)
 
 
 # ══════════════════════════════════════════════
-#  ЗАПУСК
+#  ЗАПУСК (WEBHOOK для Render)
 # ══════════════════════════════════════════════
-async def main():
+async def on_startup(**kwargs):
     global http
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
-
     http = ClientSession(headers={
         "apikey": SUPA_KEY,
         "Authorization": f"Bearer {SUPA_KEY}",
         "Content-Type": "application/json",
     })
+    await bot.set_webhook(f"{BASE_URL}{WH_PATH}")
+    logging.info("Webhook set, Supabase connected")
 
-    await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Bot started in POLLING mode")
 
-    try:
-        await dp.start_polling(bot)
-    finally:
+async def on_shutdown(**kwargs):
+    global http
+    if http:
         await http.close()
-        await bot.session.close()
+        http = None
+
+
+async def health(_r):
+    return web.Response(text="OK")
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    SimpleRequestHandler(
+        dispatcher=dp, bot=bot
+    ).register(app, path=WH_PATH)
+    setup_application(app, dp, bot=bot)
+
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
