@@ -5,13 +5,15 @@ import logging
 from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.enums import ContentType, ChatMemberStatus
+from aiogram.enums import ContentType, ChatMemberStatus, ParseMode
 from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
+    InputMediaPhoto,
+    InputMediaVideo,
 )
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -34,6 +36,8 @@ PORT     = int(os.environ.get("PORT", 10000))
 
 CHANNEL_ID   = os.environ.get("CHANNEL_ID", "")
 CHANNEL_LINK = "https://t.me/venoloadertgk"
+OWNER_LINK   = os.environ.get("OWNER_LINK", "https://t.me/venodev")
+START_PHOTO  = os.environ.get("START_PHOTO", "")
 
 sub_required   = True if CHANNEL_ID else False
 notify_uploads = True
@@ -63,7 +67,7 @@ ROLE_COMMANDS = {
 }
 
 # ══════════════════════════════════════════════
-#  МЕНЮ КОМАНД (/ в Telegram)
+#  МЕНЮ КОМАНД
 # ══════════════════════════════════════════════
 USER_COMMANDS = [
     BotCommand(command="start", description="Запуск бота"),
@@ -71,6 +75,7 @@ USER_COMMANDS = [
 
 ADMIN_COMMANDS = [
     BotCommand(command="start",   description="Главное меню"),
+    BotCommand(command="post",    description="Создать пост"),
     BotCommand(command="list",    description="Все файлы"),
     BotCommand(command="myfiles", description="Мои файлы"),
     BotCommand(command="find",    description="Поиск файлов"),
@@ -100,61 +105,31 @@ OWNER_COMMANDS = SENIOR_COMMANDS + [
 
 
 async def setup_commands():
-    """Устанавливает меню команд для разных ролей."""
-    # Команды по умолчанию (для обычных пользователей)
-    await bot.set_my_commands(
-        USER_COMMANDS,
-        scope=BotCommandScopeDefault()
-    )
-
-    # Команды для владельца
-    await bot.set_my_commands(
-        OWNER_COMMANDS,
-        scope=BotCommandScopeChat(chat_id=OWNER_ID)
-    )
-
-    # Команды для каждого админа
+    await bot.set_my_commands(USER_COMMANDS, scope=BotCommandScopeDefault())
+    await bot.set_my_commands(OWNER_COMMANDS, scope=BotCommandScopeChat(chat_id=OWNER_ID))
     admins = await get_all_admins()
     for admin in admins:
         uid = admin.get("user_id")
         role = admin.get("role", 0)
         try:
             if role >= 3:
-                await bot.set_my_commands(
-                    SENIOR_COMMANDS,
-                    scope=BotCommandScopeChat(chat_id=uid)
-                )
+                await bot.set_my_commands(SENIOR_COMMANDS, scope=BotCommandScopeChat(chat_id=uid))
             elif role >= 1:
-                await bot.set_my_commands(
-                    ADMIN_COMMANDS,
-                    scope=BotCommandScopeChat(chat_id=uid)
-                )
+                await bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=uid))
         except Exception:
             pass
 
 
 async def update_user_commands(user_id: int, role: int):
-    """Обновляет меню команд для конкретного пользователя."""
     try:
         if role >= 4:
-            await bot.set_my_commands(
-                OWNER_COMMANDS,
-                scope=BotCommandScopeChat(chat_id=user_id)
-            )
+            await bot.set_my_commands(OWNER_COMMANDS, scope=BotCommandScopeChat(chat_id=user_id))
         elif role >= 3:
-            await bot.set_my_commands(
-                SENIOR_COMMANDS,
-                scope=BotCommandScopeChat(chat_id=user_id)
-            )
+            await bot.set_my_commands(SENIOR_COMMANDS, scope=BotCommandScopeChat(chat_id=user_id))
         elif role >= 1:
-            await bot.set_my_commands(
-                ADMIN_COMMANDS,
-                scope=BotCommandScopeChat(chat_id=user_id)
-            )
+            await bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=user_id))
         else:
-            await bot.delete_my_commands(
-                scope=BotCommandScopeChat(chat_id=user_id)
-            )
+            await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=user_id))
     except Exception:
         pass
 
@@ -166,6 +141,14 @@ def sub_keyboard(file_code: str = "") -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="📢 Подписаться", url=CHANNEL_LINK)],
         [InlineKeyboardButton(text="✅ Я подписался", callback_data=f"checksub:{file_code}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def start_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="📢 Наш канал", url=CHANNEL_LINK)],
+        [InlineKeyboardButton(text="💬 Связаться с владельцем", url=OWNER_LINK)],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -198,15 +181,25 @@ class BroadcastState(StatesGroup):
     waiting_message = State()
 
 
+class PostState(StatesGroup):
+    waiting_title = State()
+    waiting_requirements = State()
+    waiting_features = State()
+    waiting_tutorial = State()
+    waiting_download_count = State()
+    waiting_download_buttons = State()
+    waiting_media = State()
+    waiting_channel = State()
+    confirm = State()
+
+
 # ══════════════════════════════════════════════
 #  БАЗА ДАННЫХ — админы
 # ══════════════════════════════════════════════
 async def get_role(user_id: int) -> int:
     if user_id == OWNER_ID:
         return 4
-    async with http.get(
-        f"{ADMINS_TABLE}?user_id=eq.{user_id}&select=*"
-    ) as r:
+    async with http.get(f"{ADMINS_TABLE}?user_id=eq.{user_id}&select=*") as r:
         data = await r.json()
         if data:
             return data[0].get("role", 0)
@@ -216,9 +209,7 @@ async def get_role(user_id: int) -> int:
 async def get_admin_info(user_id: int) -> dict | None:
     if user_id == OWNER_ID:
         return {"user_id": OWNER_ID, "role": 4, "username": "owner"}
-    async with http.get(
-        f"{ADMINS_TABLE}?user_id=eq.{user_id}&select=*"
-    ) as r:
+    async with http.get(f"{ADMINS_TABLE}?user_id=eq.{user_id}&select=*") as r:
         data = await r.json()
         return data[0] if data else None
 
@@ -242,17 +233,13 @@ async def set_admin(user_id: int, role: int, username: str):
 
 
 async def remove_admin(user_id: int):
-    async with http.delete(
-        f"{ADMINS_TABLE}?user_id=eq.{user_id}"
-    ) as r:
+    async with http.delete(f"{ADMINS_TABLE}?user_id=eq.{user_id}") as r:
         pass
     await update_user_commands(user_id, 0)
 
 
 async def get_all_admins():
-    async with http.get(
-        f"{ADMINS_TABLE}?select=*&order=role.desc"
-    ) as r:
+    async with http.get(f"{ADMINS_TABLE}?select=*&order=role.desc") as r:
         return await r.json()
 
 
@@ -398,6 +385,67 @@ def can_delete_file(deleter_role: int, deleter_id: int, file_entry: dict) -> boo
 
 
 # ══════════════════════════════════════════════
+#  ПОСТРОЕНИЕ ПОСТА
+# ══════════════════════════════════════════════
+def build_post_text(data: dict) -> str:
+    """Собирает текст поста из данных FSM."""
+    parts = []
+
+    # Заголовок — blockquote
+    title = data.get("title", "")
+    if title:
+        parts.append(f"<blockquote><b>{title}</b></blockquote>")
+
+    # Требования — blockquote
+    requirements = data.get("requirements", "")
+    if requirements and requirements != "-":
+        parts.append(f"<blockquote>📋 <b>Требования:</b>\n{requirements}</blockquote>")
+
+    # Функции — blockquote expandable (сворачиваемый)
+    features = data.get("features", "")
+    if features and features != "-":
+        feature_lines = features.strip().split("\n")
+        formatted = "\n".join(f"• {line.strip()}" for line in feature_lines if line.strip())
+        if len(feature_lines) > 5:
+            parts.append(
+                f"<blockquote expandable>⚙️ <b>Функции:</b>\n{formatted}</blockquote>"
+            )
+        else:
+            parts.append(
+                f"<blockquote>⚙️ <b>Функции:</b>\n{formatted}</blockquote>"
+            )
+
+    # Туториал
+    tutorial = data.get("tutorial", "")
+    if tutorial and tutorial != "-":
+        parts.append(f"<blockquote>📖 <b>Туториал:</b>\n{tutorial}</blockquote>")
+
+    # Кнопки скачивания (текст)
+    download_buttons = data.get("download_buttons", [])
+    if download_buttons:
+        dl_lines = []
+        for btn in download_buttons:
+            dl_lines.append(f"📥 <b>{btn['name']}:</b> <a href=\"{btn['url']}\">тык</a>")
+        parts.append("\n".join(dl_lines))
+
+    return "\n\n".join(parts)
+
+
+def build_post_keyboard(data: dict) -> InlineKeyboardMarkup | None:
+    """Собирает inline-кнопки скачивания."""
+    download_buttons = data.get("download_buttons", [])
+    if not download_buttons:
+        return None
+
+    buttons = []
+    for btn in download_buttons:
+        buttons.append([
+            InlineKeyboardButton(text=f"📥 {btn['name']}", url=btn["url"])
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ══════════════════════════════════════════════
 #  БОТ
 # ══════════════════════════════════════════════
 bot    = Bot(token=TOKEN)
@@ -423,6 +471,7 @@ async def cmd_start(msg: types.Message, state: FSMContext):
 
     args = msg.text.split(maxsplit=1)
 
+    # Если пришли по ссылке на файл
     if len(args) > 1:
         code = args[1]
         entry = await db_get(code)
@@ -446,26 +495,61 @@ async def cmd_start(msg: types.Message, state: FSMContext):
         return
 
     role = await get_role(msg.from_user.id)
+    username = get_username_display(msg.from_user)
 
+    # ── Админское меню ──
     if role >= 1:
         users = await count_users()
         rows = await db_all()
         sub_status = "✅ ВКЛ" if sub_required else "❌ ВЫКЛ"
         notify_status = "✅ ВКЛ" if notify_uploads else "❌ ВЫКЛ"
 
-        cmds = (
+        text = (
+            f"👋 <b>Приветствую, {username}!</b>\n\n"
             f"<b>Ваша роль:</b> {ROLES[role]}\n\n"
             f"📂 Файлов: <b>{len(rows)}</b>\n"
             f"👥 Пользователей: <b>{users}</b>\n"
             f"📢 Подписка: <b>{sub_status}</b>\n"
             f"🔔 Уведомления: <b>{notify_status}</b>\n\n"
             f"📤 <b>Отправьте файл</b> — сохранить\n"
+            f"📝 <b>/post</b> — создать пост в канал\n"
             f"Нажмите <b>/</b> чтобы увидеть все команды"
         )
 
-        await msg.answer(cmds, parse_mode="HTML")
+        if START_PHOTO:
+            try:
+                await msg.answer_photo(
+                    photo=START_PHOTO,
+                    caption=text,
+                    parse_mode="HTML",
+                    reply_markup=start_keyboard(),
+                )
+                return
+            except Exception:
+                pass
+
+        await msg.answer(text, parse_mode="HTML", reply_markup=start_keyboard())
+
+    # ── Обычный пользователь ──
     else:
-        await msg.answer("👋 Привет! Перейдите по ссылке от отправителя.")
+        text = (
+            f"👋 <b>Приветствую, {username}, в боте для выдачи файлов!</b>\n\n"
+            f"Перейдите по ссылке от отправителя чтобы получить файл."
+        )
+
+        if START_PHOTO:
+            try:
+                await msg.answer_photo(
+                    photo=START_PHOTO,
+                    caption=text,
+                    parse_mode="HTML",
+                    reply_markup=start_keyboard(),
+                )
+                return
+            except Exception:
+                pass
+
+        await msg.answer(text, parse_mode="HTML", reply_markup=start_keyboard())
 
 
 # ────────── Подписка ──────────
@@ -496,6 +580,413 @@ async def check_sub_callback(call: types.CallbackQuery):
         logging.error(f"Send error: {e}")
         await call.message.answer("❌ Ошибка отправки.")
     await call.answer()
+
+
+# ══════════════════════════════════════════════
+#  СОЗДАНИЕ ПОСТОВ — /post
+# ══════════════════════════════════════════════
+def post_cancel_hint() -> str:
+    return "\n\n💡 Отправьте <code>-</code> чтобы пропустить\n/cancel — отмена"
+
+
+@router.message(Command("post"))
+async def cmd_post(msg: types.Message, state: FSMContext):
+    role = await get_role(msg.from_user.id)
+    if role < 1:
+        return await msg.answer("⛔ Только админы могут создавать посты.")
+
+    await state.clear()
+    await state.set_state(PostState.waiting_title)
+    await msg.answer(
+        "📝 <b>Создание поста — Шаг 1/7</b>\n\n"
+        "Введите <b>заголовок</b> поста:" + post_cancel_hint(),
+        parse_mode="HTML",
+    )
+
+
+# ── Шаг 1: Заголовок ──
+@router.message(PostState.waiting_title)
+async def post_title(msg: types.Message, state: FSMContext):
+    if msg.text and msg.text.startswith("/"):
+        return
+
+    await state.update_data(title=msg.text or "Без заголовка")
+    await state.set_state(PostState.waiting_requirements)
+    await msg.answer(
+        "📋 <b>Шаг 2/7 — Требования</b>\n\n"
+        "Введите требования (каждое с новой строки):" + post_cancel_hint(),
+        parse_mode="HTML",
+    )
+
+
+# ── Шаг 2: Требования ──
+@router.message(PostState.waiting_requirements)
+async def post_requirements(msg: types.Message, state: FSMContext):
+    if msg.text and msg.text.startswith("/"):
+        return
+
+    text = msg.text or "-"
+    await state.update_data(requirements=text)
+    await state.set_state(PostState.waiting_features)
+    await msg.answer(
+        "⚙️ <b>Шаг 3/7 — Функции</b>\n\n"
+        "Введите функции (каждая с новой строки):\n\n"
+        "<i>Пример:</i>\n"
+        "<code>Авто-прицел\nESP\nСпидхак</code>" + post_cancel_hint(),
+        parse_mode="HTML",
+    )
+
+
+# ── Шаг 3: Функции ──
+@router.message(PostState.waiting_features)
+async def post_features(msg: types.Message, state: FSMContext):
+    if msg.text and msg.text.startswith("/"):
+        return
+
+    text = msg.text or "-"
+    await state.update_data(features=text)
+    await state.set_state(PostState.waiting_tutorial)
+    await msg.answer(
+        "📖 <b>Шаг 4/7 — Туториал</b>\n\n"
+        "Введите туториал / инструкцию:" + post_cancel_hint(),
+        parse_mode="HTML",
+    )
+
+
+# ── Шаг 4: Туториал ──
+@router.message(PostState.waiting_tutorial)
+async def post_tutorial(msg: types.Message, state: FSMContext):
+    if msg.text and msg.text.startswith("/"):
+        return
+
+    text = msg.text or "-"
+    await state.update_data(tutorial=text)
+    await state.set_state(PostState.waiting_download_count)
+    await msg.answer(
+        "📥 <b>Шаг 5/7 — Кнопки скачивания</b>\n\n"
+        "Сколько кнопок скачивания? (число)\n\n"
+        "<i>Пример:</i> <code>1</code> — одна кнопка «Скачать»\n"
+        "<code>2</code> — две кнопки (PC и Телефон)\n"
+        "<code>0</code> — без кнопок" + post_cancel_hint(),
+        parse_mode="HTML",
+    )
+
+
+# ── Шаг 5: Количество кнопок ──
+@router.message(PostState.waiting_download_count)
+async def post_download_count(msg: types.Message, state: FSMContext):
+    if msg.text and msg.text.startswith("/"):
+        return
+
+    text = (msg.text or "1").strip()
+    if text == "-":
+        text = "0"
+
+    try:
+        count = int(text)
+    except ValueError:
+        return await msg.answer("❌ Введите число.")
+
+    if count < 0:
+        count = 0
+    if count > 10:
+        return await msg.answer("❌ Максимум 10 кнопок.")
+
+    if count == 0:
+        await state.update_data(download_buttons=[], download_count=0)
+        await state.set_state(PostState.waiting_media)
+        await msg.answer(
+            "🖼 <b>Шаг 6/7 — Медиа</b>\n\n"
+            "Отправьте <b>фото</b> или <b>видео</b> для поста.\n"
+            "Отправьте <code>-</code> чтобы пропустить.",
+            parse_mode="HTML",
+        )
+        return
+
+    await state.update_data(
+        download_count=count,
+        download_buttons=[],
+        current_btn=0,
+    )
+    await state.set_state(PostState.waiting_download_buttons)
+    await msg.answer(
+        f"📥 <b>Кнопка 1/{count}</b>\n\n"
+        f"Введите в формате:\n"
+        f"<code>Название | ссылка</code>\n\n"
+        f"<i>Пример:</i>\n"
+        f"<code>Скачать на ПК | https://example.com/pc</code>",
+        parse_mode="HTML",
+    )
+
+
+# ── Шаг 5.5: Ввод каждой кнопки ──
+@router.message(PostState.waiting_download_buttons)
+async def post_download_buttons(msg: types.Message, state: FSMContext):
+    if msg.text and msg.text.startswith("/"):
+        return
+
+    text = (msg.text or "").strip()
+    if "|" not in text:
+        return await msg.answer(
+            "❌ Формат: <code>Название | ссылка</code>",
+            parse_mode="HTML",
+        )
+
+    parts = text.split("|", 1)
+    name = parts[0].strip()
+    url = parts[1].strip()
+
+    if not url.startswith("http"):
+        return await msg.answer("❌ Ссылка должна начинаться с http:// или https://")
+
+    data = await state.get_data()
+    buttons = data.get("download_buttons", [])
+    buttons.append({"name": name, "url": url})
+
+    current = data.get("current_btn", 0) + 1
+    total = data.get("download_count", 1)
+
+    await state.update_data(download_buttons=buttons, current_btn=current)
+
+    if current >= total:
+        await state.set_state(PostState.waiting_media)
+        await msg.answer(
+            "🖼 <b>Шаг 6/7 — Медиа</b>\n\n"
+            "Отправьте <b>фото</b> или <b>видео</b> для поста.\n"
+            "Отправьте <code>-</code> чтобы пропустить.",
+            parse_mode="HTML",
+        )
+    else:
+        next_num = current + 1
+        await msg.answer(
+            f"📥 <b>Кнопка {next_num}/{total}</b>\n\n"
+            f"Введите: <code>Название | ссылка</code>",
+            parse_mode="HTML",
+        )
+
+
+# ── Шаг 6: Медиа ──
+@router.message(PostState.waiting_media)
+async def post_media(msg: types.Message, state: FSMContext):
+    if msg.text and msg.text.startswith("/"):
+        return
+
+    if msg.text and msg.text.strip() == "-":
+        await state.update_data(media_type=None, media_id=None)
+    elif msg.photo:
+        await state.update_data(media_type="photo", media_id=msg.photo[-1].file_id)
+    elif msg.video:
+        await state.update_data(media_type="video", media_id=msg.video.file_id)
+    else:
+        return await msg.answer("❌ Отправьте фото, видео или <code>-</code> для пропуска.", parse_mode="HTML")
+
+    await state.set_state(PostState.waiting_channel)
+    await msg.answer(
+        "📢 <b>Шаг 7/7 — Канал</b>\n\n"
+        "Введите ID канала (например <code>-100123456789</code>)\n"
+        f"или отправьте <code>-</code> для канала по умолчанию\n({CHANNEL_ID or 'не задан'})",
+        parse_mode="HTML",
+    )
+
+
+# ── Шаг 7: Канал ──
+@router.message(PostState.waiting_channel)
+async def post_channel(msg: types.Message, state: FSMContext):
+    if msg.text and msg.text.startswith("/"):
+        return
+
+    text = (msg.text or "").strip()
+
+    if text == "-" or text == "":
+        if not CHANNEL_ID:
+            return await msg.answer("❌ Канал по умолчанию не задан. Введите ID канала.")
+        target_channel = int(CHANNEL_ID)
+    else:
+        try:
+            target_channel = int(text)
+        except ValueError:
+            return await msg.answer("❌ ID канала должен быть числом.")
+
+    await state.update_data(target_channel=target_channel)
+
+    # Показать предпросмотр
+    data = await state.get_data()
+    post_text = build_post_text(data)
+    keyboard = build_post_keyboard(data)
+
+    preview_text = (
+        f"👀 <b>Предпросмотр поста:</b>\n\n"
+        f"{'─' * 30}\n\n"
+        f"{post_text}\n\n"
+        f"{'─' * 30}\n\n"
+        f"📢 Канал: <code>{target_channel}</code>\n"
+        f"🖼 Медиа: {'✅ Есть' if data.get('media_type') else '❌ Нет'}\n\n"
+    )
+
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Отправить", callback_data="post_confirm"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data="post_cancel"),
+        ],
+        [
+            InlineKeyboardButton(text="👀 Тест (себе)", callback_data="post_test"),
+        ],
+    ])
+
+    await state.set_state(PostState.confirm)
+
+    # Если есть медиа — показать с медиа
+    media_type = data.get("media_type")
+    media_id = data.get("media_id")
+
+    if media_type == "photo" and media_id:
+        try:
+            await msg.answer_photo(
+                photo=media_id,
+                caption=preview_text,
+                parse_mode="HTML",
+                reply_markup=confirm_kb,
+            )
+            return
+        except Exception:
+            pass
+    elif media_type == "video" and media_id:
+        try:
+            await msg.answer_video(
+                video=media_id,
+                caption=preview_text,
+                parse_mode="HTML",
+                reply_markup=confirm_kb,
+            )
+            return
+        except Exception:
+            pass
+
+    await msg.answer(preview_text, parse_mode="HTML", reply_markup=confirm_kb)
+
+
+# ── Подтверждение / отмена / тест ──
+@router.callback_query(F.data == "post_confirm")
+async def post_confirm_handler(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("title"):
+        await call.answer("❌ Данные потеряны, начните заново.", show_alert=True)
+        await state.clear()
+        return
+
+    target_channel = data.get("target_channel")
+    post_text = build_post_text(data)
+    keyboard = build_post_keyboard(data)
+    media_type = data.get("media_type")
+    media_id = data.get("media_id")
+
+    try:
+        if media_type == "photo" and media_id:
+            await bot.send_photo(
+                chat_id=target_channel,
+                photo=media_id,
+                caption=post_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        elif media_type == "video" and media_id:
+            await bot.send_video(
+                chat_id=target_channel,
+                video=media_id,
+                caption=post_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        else:
+            await bot.send_message(
+                chat_id=target_channel,
+                text=post_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+
+        await call.message.edit_reply_markup(reply_markup=None)
+        await call.message.answer(
+            f"✅ <b>Пост отправлен!</b>\n📢 Канал: <code>{target_channel}</code>",
+            parse_mode="HTML",
+        )
+
+        # Уведомить владельца
+        if notify_uploads and call.from_user.id != OWNER_ID:
+            try:
+                await bot.send_message(
+                    OWNER_ID,
+                    f"📝 <b>Новый пост создан</b>\n\n"
+                    f"👤 {get_username_display(call.from_user)}\n"
+                    f"📢 Канал: <code>{target_channel}</code>\n"
+                    f"📋 Заголовок: {data.get('title', '?')}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+    except Exception as e:
+        logging.error(f"Post send error: {e}")
+        await call.message.answer(
+            f"❌ <b>Ошибка отправки</b>\n\n"
+            f"<code>{str(e)[:200]}</code>\n\n"
+            f"Убедитесь что бот — админ канала с правом публикации.",
+            parse_mode="HTML",
+        )
+
+    await state.clear()
+    await call.answer()
+
+
+@router.callback_query(F.data == "post_cancel")
+async def post_cancel_handler(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer("❌ Создание поста отменено.")
+    await call.answer()
+
+
+@router.callback_query(F.data == "post_test")
+async def post_test_handler(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("title"):
+        await call.answer("❌ Данные потеряны.", show_alert=True)
+        return
+
+    post_text = build_post_text(data)
+    keyboard = build_post_keyboard(data)
+    media_type = data.get("media_type")
+    media_id = data.get("media_id")
+
+    try:
+        if media_type == "photo" and media_id:
+            await bot.send_photo(
+                chat_id=call.from_user.id,
+                photo=media_id,
+                caption=post_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        elif media_type == "video" and media_id:
+            await bot.send_video(
+                chat_id=call.from_user.id,
+                video=media_id,
+                caption=post_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        else:
+            await bot.send_message(
+                chat_id=call.from_user.id,
+                text=post_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        await call.answer("✅ Тестовый пост отправлен вам в ЛС!")
+    except Exception as e:
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
 
 
 # ══════════════════════════════════════════════
@@ -635,11 +1126,7 @@ async def cmd_removeadmin(msg: types.Message):
     )
 
     try:
-        await bot.send_message(
-            target_id,
-            f"❌ <b>Вы сняты с должности</b> {ROLES[target_role]}",
-            parse_mode="HTML",
-        )
+        await bot.send_message(target_id, "❌ <b>Вы сняты с должности админа.</b>", parse_mode="HTML")
     except Exception:
         pass
 
@@ -673,7 +1160,7 @@ async def cmd_demote(msg: types.Message):
     target_username = target_info.get("username", str(target_id))
 
     if target_role <= 1:
-        return await msg.answer("❌ Уже на минимальной позиции. Используйте /removeadmin")
+        return await msg.answer("❌ Нельзя понизить — уже минимальная роль. Используйте /removeadmin")
 
     if not can_manage(caller_role, target_role) and caller_role < 4:
         return await msg.answer("⛔ Нельзя понизить админа с ролью равной или выше вашей.")
@@ -699,9 +1186,8 @@ async def cmd_demote(msg: types.Message):
             OWNER_ID,
             f"⚠️ <b>Запрос на понижение</b>\n\n"
             f"{ROLES[caller_role]} {caller_name}\n"
-            f"хочет понизить {ROLES[target_role]} админа\n"
-            f"👤 {target_username} (ID: {target_id})\n"
-            f"📋 {ROLES[target_role]} → {ROLES[new_role]}",
+            f"хочет понизить {target_username}\n"
+            f"{ROLES[target_role]} → {ROLES[new_role]}",
             parse_mode="HTML",
             reply_markup=buttons,
         )
@@ -709,8 +1195,7 @@ async def cmd_demote(msg: types.Message):
 
     await set_admin(target_id, new_role, target_username)
     await msg.answer(
-        f"✅ {target_username} понижен:\n"
-        f"{ROLES[target_role]} → {ROLES[new_role]}",
+        f"⬇️ {target_username} понижен: {ROLES[target_role]} → {ROLES[new_role]}",
         parse_mode="HTML",
     )
 
@@ -727,18 +1212,13 @@ async def cmd_demote(msg: types.Message):
 @router.message(Command("resign"))
 async def cmd_resign(msg: types.Message):
     role = await get_role(msg.from_user.id)
-
-    if msg.from_user.id == OWNER_ID:
-        return await msg.answer("👑 Владелец не может снять себя.")
-
     if role < 1:
         return await msg.answer("❌ Вы не админ.")
+    if msg.from_user.id == OWNER_ID:
+        return await msg.answer("⛔ Владелец не может снять себя.")
 
     await remove_admin(msg.from_user.id)
-    await msg.answer(
-        f"✅ Вы сняли с себя роль {ROLES[role]}.",
-        parse_mode="HTML",
-    )
+    await msg.answer("✅ Вы сняли с себя админку.")
 
     try:
         await bot.send_message(
@@ -780,7 +1260,6 @@ async def cmd_adminstats(msg: types.Message):
         return await msg.answer("⛔ Недостаточно прав.")
 
     rows = await db_all()
-
     stats = {}
     for e in rows:
         uid = e.get("uploaded_by", 0)
@@ -795,7 +1274,6 @@ async def cmd_adminstats(msg: types.Message):
 
     lines = []
     sorted_stats = sorted(stats.items(), key=lambda x: x[1]["files"], reverse=True)
-
     for uid, s in sorted_stats:
         r = await get_role(uid)
         lines.append(
@@ -805,7 +1283,7 @@ async def cmd_adminstats(msg: types.Message):
 
     text = f"📊 <b>Статистика по админам:</b>\n\n" + "\n\n".join(lines)
     for i in range(0, len(text), 4000):
-        await msg.answer(text[i:i+4000], parse_mode="HTML")
+        await msg.answer(text[i:i + 4000], parse_mode="HTML")
 
 
 # ══════════════════════════════════════════════
@@ -821,7 +1299,6 @@ async def approve_remove(call: types.CallbackQuery):
     requester_id = int(parts[2])
 
     await remove_admin(target_id)
-
     await call.message.edit_text(
         call.message.text + "\n\n✅ <b>ОДОБРЕНО</b>",
         parse_mode="HTML",
@@ -872,18 +1349,13 @@ async def approve_demote(call: types.CallbackQuery):
     username = target_info.get("username", str(target_id)) if target_info else str(target_id)
 
     await set_admin(target_id, new_role, username)
-
     await call.message.edit_text(
         call.message.text + "\n\n✅ <b>ОДОБРЕНО</b>",
         parse_mode="HTML",
     )
 
     try:
-        await bot.send_message(
-            target_id,
-            f"⬇️ <b>Вы понижены до:</b> {ROLES[new_role]}",
-            parse_mode="HTML",
-        )
+        await bot.send_message(target_id, f"⬇️ <b>Вы понижены до:</b> {ROLES[new_role]}", parse_mode="HTML")
     except Exception:
         pass
     try:
@@ -924,10 +1396,7 @@ async def cmd_ban(msg: types.Message):
 
     parts = msg.text.split(maxsplit=2)
     if len(parts) < 2:
-        return await msg.answer(
-            "📝 <b>Формат:</b> /ban <code>user_id</code> [причина]",
-            parse_mode="HTML",
-        )
+        return await msg.answer("📝 <b>Формат:</b> /ban <code>user_id</code> [причина]", parse_mode="HTML")
 
     try:
         target_id = int(parts[1])
@@ -955,11 +1424,7 @@ async def cmd_ban(msg: types.Message):
     )
 
     try:
-        await bot.send_message(
-            target_id,
-            f"🚫 <b>Вы заблокированы</b>\n📝 Причина: {reason}",
-            parse_mode="HTML",
-        )
+        await bot.send_message(target_id, f"🚫 <b>Вы заблокированы</b>\n📝 Причина: {reason}", parse_mode="HTML")
     except Exception:
         pass
 
@@ -972,10 +1437,7 @@ async def cmd_unban(msg: types.Message):
 
     parts = msg.text.split()
     if len(parts) < 2:
-        return await msg.answer(
-            "📝 <b>Формат:</b> /unban <code>user_id</code>",
-            parse_mode="HTML",
-        )
+        return await msg.answer("📝 <b>Формат:</b> /unban <code>user_id</code>", parse_mode="HTML")
 
     try:
         target_id = int(parts[1])
@@ -986,11 +1448,7 @@ async def cmd_unban(msg: types.Message):
         return await msg.answer("❌ Пользователь не забанен.")
 
     await remove_ban(target_id)
-
-    await msg.answer(
-        f"✅ Пользователь <code>{target_id}</code> разбанен.",
-        parse_mode="HTML",
-    )
+    await msg.answer(f"✅ Пользователь <code>{target_id}</code> разбанен.", parse_mode="HTML")
 
     try:
         await bot.send_message(target_id, "✅ <b>Вы разблокированы!</b>", parse_mode="HTML")
@@ -1025,10 +1483,7 @@ async def cmd_notify(msg: types.Message):
     global notify_uploads
     notify_uploads = not notify_uploads
     status = "✅ ВКЛ" if notify_uploads else "❌ ВЫКЛ"
-    await msg.answer(
-        f"🔔 <b>Уведомления о загрузках:</b> {status}",
-        parse_mode="HTML",
-    )
+    await msg.answer(f"🔔 <b>Уведомления о загрузках:</b> {status}", parse_mode="HTML")
 
 
 # ══════════════════════════════════════════════
@@ -1124,6 +1579,10 @@ async def save_file_handler(msg: types.Message, state: FSMContext):
     if current == BroadcastState.waiting_message:
         return
 
+    # Если ждём медиа для поста
+    if current == PostState.waiting_media:
+        return  # Обрабатывается в post_media
+
     code = uuid.uuid4().hex[:8]
     entry = {
         "caption": msg.caption or "",
@@ -1134,14 +1593,14 @@ async def save_file_handler(msg: types.Message, state: FSMContext):
     }
 
     extractors = [
-        (msg.document,   "document",   lambda: (msg.document.file_id, msg.document.file_name or "file")),
-        (msg.photo,      "photo",      lambda: (msg.photo[-1].file_id, "photo.jpg")),
-        (msg.video,      "video",      lambda: (msg.video.file_id, msg.video.file_name or "video.mp4")),
-        (msg.audio,      "audio",      lambda: (msg.audio.file_id, msg.audio.file_name or "audio.mp3")),
-        (msg.voice,      "voice",      lambda: (msg.voice.file_id, "voice.ogg")),
+        (msg.document, "document", lambda: (msg.document.file_id, msg.document.file_name or "file")),
+        (msg.photo, "photo", lambda: (msg.photo[-1].file_id, "photo.jpg")),
+        (msg.video, "video", lambda: (msg.video.file_id, msg.video.file_name or "video.mp4")),
+        (msg.audio, "audio", lambda: (msg.audio.file_id, msg.audio.file_name or "audio.mp3")),
+        (msg.voice, "voice", lambda: (msg.voice.file_id, "voice.ogg")),
         (msg.video_note, "video_note", lambda: (msg.video_note.file_id, "circle.mp4")),
-        (msg.animation,  "animation",  lambda: (msg.animation.file_id, "animation.gif")),
-        (msg.sticker,    "sticker",    lambda: (msg.sticker.file_id, "sticker")),
+        (msg.animation, "animation", lambda: (msg.animation.file_id, "animation.gif")),
+        (msg.sticker, "sticker", lambda: (msg.sticker.file_id, "sticker")),
     ]
 
     for obj, ftype, fn in extractors:
@@ -1176,7 +1635,6 @@ async def save_file_handler(msg: types.Message, state: FSMContext):
             pass
 
 
-# ── /find — поиск файлов ──
 @router.message(Command("find"))
 async def cmd_find(msg: types.Message):
     role = await get_role(msg.from_user.id)
@@ -1185,10 +1643,7 @@ async def cmd_find(msg: types.Message):
 
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
-        return await msg.answer(
-            "📝 <b>Формат:</b> /find <code>название</code>",
-            parse_mode="HTML",
-        )
+        return await msg.answer("📝 <b>Формат:</b> /find <code>название</code>", parse_mode="HTML")
 
     query = parts[1].strip().lower()
     rows = await db_all()
@@ -1208,17 +1663,16 @@ async def cmd_find(msg: types.Message):
         up_role = e.get("uploader_role") or 0
         downloads = e.get("downloads") or 0
         lines.append(
-            f"📁 <b>{e.get('name','?')}</b> 📥{downloads}\n"
+            f"📁 <b>{e.get('name', '?')}</b> 📥{downloads}\n"
             f"   👤 {uploader} ({ROLES.get(up_role, '?')})\n"
             f"   <code>{e['code']}</code>\n   {link}"
         )
 
     text = f"🔍 <b>Найдено ({len(found)}):</b>\n\n" + "\n\n".join(lines)
     for i in range(0, len(text), 4000):
-        await msg.answer(text[i:i+4000], parse_mode="HTML", disable_web_page_preview=True)
+        await msg.answer(text[i:i + 4000], parse_mode="HTML", disable_web_page_preview=True)
 
 
-# ── /info — информация о файле ──
 @router.message(Command("info"))
 async def cmd_info(msg: types.Message):
     role = await get_role(msg.from_user.id)
@@ -1227,10 +1681,7 @@ async def cmd_info(msg: types.Message):
 
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
-        return await msg.answer(
-            "📝 <b>Формат:</b> /info <code>код</code>",
-            parse_mode="HTML",
-        )
+        return await msg.answer("📝 <b>Формат:</b> /info <code>код</code>", parse_mode="HTML")
 
     code = parts[1].strip()
     entry = await db_get(code)
@@ -1257,7 +1708,6 @@ async def cmd_info(msg: types.Message):
     )
 
 
-# ── /rename — переименование ──
 @router.message(Command("rename"))
 async def cmd_rename(msg: types.Message):
     role = await get_role(msg.from_user.id)
@@ -1282,15 +1732,13 @@ async def cmd_rename(msg: types.Message):
         return await msg.answer("⛔ Нет прав на изменение этого файла.")
 
     await db_rename(code, new_name)
-
     await msg.answer(
         f"✅ <b>Переименовано:</b>\n"
-        f"📁 {entry.get('name','?')} → <b>{new_name}</b>",
+        f"📁 {entry.get('name', '?')} → <b>{new_name}</b>",
         parse_mode="HTML",
     )
 
 
-# ── /myfiles — мои файлы ──
 @router.message(Command("myfiles"))
 async def cmd_myfiles(msg: types.Message):
     role = await get_role(msg.from_user.id)
@@ -1308,15 +1756,14 @@ async def cmd_myfiles(msg: types.Message):
         link = f"https://t.me/{BOT_USER}?start={e['code']}"
         downloads = e.get("downloads") or 0
         lines.append(
-            f"📁 <b>{e.get('name','?')}</b> 📥{downloads}\n"
+            f"📁 <b>{e.get('name', '?')}</b> 📥{downloads}\n"
             f"   <code>{e['code']}</code>\n   {link}"
         )
     text = f"📂 <b>Ваши файлы ({len(my)}):</b>\n\n" + "\n\n".join(lines)
     for i in range(0, len(text), 4000):
-        await msg.answer(text[i:i+4000], parse_mode="HTML", disable_web_page_preview=True)
+        await msg.answer(text[i:i + 4000], parse_mode="HTML", disable_web_page_preview=True)
 
 
-# ── /list — все файлы ──
 @router.message(Command("list"))
 async def cmd_list(msg: types.Message):
     role = await get_role(msg.from_user.id)
@@ -1334,16 +1781,15 @@ async def cmd_list(msg: types.Message):
         up_role = e.get("uploader_role") or 0
         downloads = e.get("downloads") or 0
         lines.append(
-            f"📁 <b>{e.get('name','?')}</b> 📥{downloads}\n"
+            f"📁 <b>{e.get('name', '?')}</b> 📥{downloads}\n"
             f"   👤 {uploader} ({ROLES.get(up_role, '?')})\n"
             f"   <code>{e['code']}</code>\n   {link}"
         )
     text = f"📂 <b>Все файлы ({len(rows)}):</b>\n\n" + "\n\n".join(lines)
     for i in range(0, len(text), 4000):
-        await msg.answer(text[i:i+4000], parse_mode="HTML", disable_web_page_preview=True)
+        await msg.answer(text[i:i + 4000], parse_mode="HTML", disable_web_page_preview=True)
 
 
-# ── /del — удалить файл ──
 @router.message(Command("del"))
 async def cmd_del(msg: types.Message):
     role = await get_role(msg.from_user.id)
@@ -1352,10 +1798,7 @@ async def cmd_del(msg: types.Message):
 
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
-        return await msg.answer(
-            "📝 <b>Формат:</b> /del <code>код</code>",
-            parse_mode="HTML",
-        )
+        return await msg.answer("📝 <b>Формат:</b> /del <code>код</code>", parse_mode="HTML")
 
     code = parts[1].strip()
     entry = await db_get(code)
@@ -1367,13 +1810,12 @@ async def cmd_del(msg: types.Message):
 
     await db_delete(code)
     await msg.answer(
-        f"🗑 <b>Удалено:</b> {entry.get('name','?')}\n"
+        f"🗑 <b>Удалено:</b> {entry.get('name', '?')}\n"
         f"👤 Загружал: {entry.get('uploader_name', '?')}",
         parse_mode="HTML",
     )
 
 
-# ── /stats — статистика ──
 @router.message(Command("stats"))
 async def cmd_stats(msg: types.Message):
     role = await get_role(msg.from_user.id)
@@ -1385,11 +1827,7 @@ async def cmd_stats(msg: types.Message):
     total = len(rows)
     dl = sum(e.get("downloads") or 0 for e in rows)
 
-    top = sorted(
-        rows,
-        key=lambda x: x.get("downloads") or 0,
-        reverse=True
-    )[:5]
+    top = sorted(rows, key=lambda x: x.get("downloads") or 0, reverse=True)[:5]
 
     top_lines = []
     for i, e in enumerate(top, 1):
@@ -1426,7 +1864,7 @@ async def cmd_stats(msg: types.Message):
 
 # ── Fallback ──
 @router.message()
-async def fallback(msg: types.Message):
+async def fallback(msg: types.Message, state: FSMContext):
     if await is_banned(msg.from_user.id):
         return await msg.answer("🚫 Вы заблокированы.")
 
@@ -1482,9 +1920,7 @@ def main():
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
 
-    SimpleRequestHandler(
-        dispatcher=dp, bot=bot
-    ).register(app, path=WH_PATH)
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WH_PATH)
     setup_application(app, dp, bot=bot)
 
     web.run_app(app, host="0.0.0.0", port=PORT)
