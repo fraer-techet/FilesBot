@@ -187,6 +187,7 @@ class PostState(StatesGroup):
     waiting_download_count = State()
     waiting_download_name = State()
     waiting_download_file = State()
+    waiting_bottom_text = State()
     waiting_media = State()
     waiting_channel = State()
     confirm = State()
@@ -391,7 +392,6 @@ def can_delete_file(deleter_role: int, deleter_id: int, file_entry: dict) -> boo
 
 
 def extract_file_info(msg: types.Message):
-    """Извлекает file_id, type и name из сообщения с медиа."""
     extractors = [
         (msg.document,   "document",   lambda: (msg.document.file_id, msg.document.file_name or "file")),
         (msg.photo,      "photo",      lambda: (msg.photo[-1].file_id, "photo.jpg")),
@@ -410,11 +410,9 @@ def extract_file_info(msg: types.Message):
 
 
 async def save_file_to_db(msg: types.Message, role: int) -> tuple[str, str]:
-    """Сохраняет файл в БД и возвращает (code, link)."""
     fid, ftype, name = extract_file_info(msg)
     if not fid:
         return None, None
-
     code = uuid.uuid4().hex[:8]
     entry = {
         "file_id": fid,
@@ -435,20 +433,16 @@ async def save_file_to_db(msg: types.Message, role: int) -> tuple[str, str]:
 #  ПОСТРОЕНИЕ ПОСТА
 # ══════════════════════════════════════════════
 def build_post_text(data: dict) -> str:
-    """Собирает текст поста из данных FSM."""
     parts = []
 
-    # Заголовок
     title = data.get("title", "")
     if title:
         parts.append(f"<blockquote><b>{title}</b></blockquote>")
 
-    # Требования
     requirements = data.get("requirements", "")
     if requirements and requirements != "-":
         parts.append(f"<blockquote>📋 <b>Требования:</b>\n{requirements}</blockquote>")
 
-    # Функции
     features = data.get("features", "")
     if features and features != "-":
         feature_lines = features.strip().split("\n")
@@ -462,18 +456,21 @@ def build_post_text(data: dict) -> str:
                 f"<blockquote>⚙️ <b>Функции:</b>\n{formatted}</blockquote>"
             )
 
-    # Туториал
     tutorial = data.get("tutorial", "")
     if tutorial and tutorial != "-":
         parts.append(f"<blockquote>📖 <b>Туториал:</b>\n{tutorial}</blockquote>")
 
-    # Кнопки скачивания (только текст со ссылками)
     download_buttons = data.get("download_buttons", [])
     if download_buttons:
         dl_lines = []
         for btn in download_buttons:
-            dl_lines.append(f"📥 <b>{btn['name']}:</b> <a href=\"{btn['url']}\">тык</a>")
-        parts.append("\n".join(dl_lines))
+            dl_lines.append(f'📥 <b>{btn["name"]}:</b> <a href="{btn["url"]}">тык</a>')
+        dl_text = "\n".join(dl_lines)
+        parts.append(f"<blockquote>{dl_text}</blockquote>")
+
+    bottom_text = data.get("bottom_text", "")
+    if bottom_text and bottom_text != "-":
+        parts.append(f"<blockquote>{bottom_text}</blockquote>")
 
     return "\n\n".join(parts)
 
@@ -497,7 +494,6 @@ async def cmd_start(msg: types.Message, state: FSMContext):
 
     args = msg.text.split(maxsplit=1)
 
-    # Пришли по ссылке на файл
     if len(args) > 1:
         code = args[1]
         entry = await db_get(code)
@@ -523,7 +519,6 @@ async def cmd_start(msg: types.Message, state: FSMContext):
     role = await get_role(msg.from_user.id)
     username = get_username_display(msg.from_user)
 
-    # Админское меню
     if role >= 1:
         users = await count_users()
         rows = await db_all()
@@ -545,36 +540,27 @@ async def cmd_start(msg: types.Message, state: FSMContext):
         if START_PHOTO:
             try:
                 await msg.answer_photo(
-                    photo=START_PHOTO,
-                    caption=text,
-                    parse_mode="HTML",
-                    reply_markup=start_keyboard(),
+                    photo=START_PHOTO, caption=text,
+                    parse_mode="HTML", reply_markup=start_keyboard(),
                 )
                 return
             except Exception:
                 pass
-
         await msg.answer(text, parse_mode="HTML", reply_markup=start_keyboard())
-
-    # Обычный пользователь
     else:
         text = (
             f"👋 <b>Приветствую, {username}, в боте для выдачи файлов!</b>\n\n"
             f"Перейдите по ссылке от отправителя чтобы получить файл."
         )
-
         if START_PHOTO:
             try:
                 await msg.answer_photo(
-                    photo=START_PHOTO,
-                    caption=text,
-                    parse_mode="HTML",
-                    reply_markup=start_keyboard(),
+                    photo=START_PHOTO, caption=text,
+                    parse_mode="HTML", reply_markup=start_keyboard(),
                 )
                 return
             except Exception:
                 pass
-
         await msg.answer(text, parse_mode="HTML", reply_markup=start_keyboard())
 
 
@@ -582,7 +568,6 @@ async def cmd_start(msg: types.Message, state: FSMContext):
 @router.callback_query(F.data.startswith("checksub:"))
 async def check_sub_callback(call: types.CallbackQuery):
     code = call.data.split(":", 1)[1]
-
     if not await is_subscribed(call.from_user.id):
         return await call.answer("❌ Вы ещё не подписались!", show_alert=True)
 
@@ -599,7 +584,6 @@ async def check_sub_callback(call: types.CallbackQuery):
     kw = {}
     if entry["type"] not in NO_CAPTION and entry.get("caption"):
         kw["caption"] = entry["caption"]
-
     try:
         await send_method(entry["file_id"], **kw)
     except Exception as e:
@@ -620,11 +604,10 @@ async def cmd_post(msg: types.Message, state: FSMContext):
     role = await get_role(msg.from_user.id)
     if role < 1:
         return await msg.answer("⛔ Только админы могут создавать посты.")
-
     await state.clear()
     await state.set_state(PostState.waiting_title)
     await msg.answer(
-        "📝 <b>Создание поста — Шаг 1/7</b>\n\n"
+        "📝 <b>Создание поста — Шаг 1/8</b>\n\n"
         "Введите <b>заголовок</b> поста:\n\n"
         "/cancel — отмена",
         parse_mode="HTML",
@@ -636,11 +619,10 @@ async def cmd_post(msg: types.Message, state: FSMContext):
 async def post_title(msg: types.Message, state: FSMContext):
     if msg.text and msg.text.startswith("/"):
         return
-
     await state.update_data(title=msg.text or "Без заголовка")
     await state.set_state(PostState.waiting_requirements)
     await msg.answer(
-        "📋 <b>Шаг 2/7 — Требования</b>\n\n"
+        "📋 <b>Шаг 2/8 — Требования</b>\n\n"
         "Введите требования:" + post_cancel_hint(),
         parse_mode="HTML",
     )
@@ -651,11 +633,10 @@ async def post_title(msg: types.Message, state: FSMContext):
 async def post_requirements(msg: types.Message, state: FSMContext):
     if msg.text and msg.text.startswith("/"):
         return
-
     await state.update_data(requirements=msg.text or "-")
     await state.set_state(PostState.waiting_features)
     await msg.answer(
-        "⚙️ <b>Шаг 3/7 — Функции</b>\n\n"
+        "⚙️ <b>Шаг 3/8 — Функции</b>\n\n"
         "Введите функции (каждая с новой строки):\n\n"
         "<i>Пример:</i>\n"
         "<code>Авто-прицел\nESP\nСпидхак</code>" + post_cancel_hint(),
@@ -668,11 +649,10 @@ async def post_requirements(msg: types.Message, state: FSMContext):
 async def post_features(msg: types.Message, state: FSMContext):
     if msg.text and msg.text.startswith("/"):
         return
-
     await state.update_data(features=msg.text or "-")
     await state.set_state(PostState.waiting_tutorial)
     await msg.answer(
-        "📖 <b>Шаг 4/7 — Туториал</b>\n\n"
+        "📖 <b>Шаг 4/8 — Туториал</b>\n\n"
         "Введите туториал / инструкцию:" + post_cancel_hint(),
         parse_mode="HTML",
     )
@@ -683,60 +663,51 @@ async def post_features(msg: types.Message, state: FSMContext):
 async def post_tutorial(msg: types.Message, state: FSMContext):
     if msg.text and msg.text.startswith("/"):
         return
-
     await state.update_data(tutorial=msg.text or "-")
     await state.set_state(PostState.waiting_download_count)
     await msg.answer(
-        "📥 <b>Шаг 5/7 — Кнопки скачивания</b>\n\n"
-        "Сколько ссылок для скачивания? (число)\n\n"
+        "📥 <b>Шаг 5/8 — Ссылки для скачивания</b>\n\n"
+        "Сколько ссылок? (число)\n\n"
         "<i>Пример:</i>\n"
-        "<code>1</code> — одна ссылка «Скачать»\n"
-        "<code>2</code> — две ссылки (ПК и Телефон)\n"
+        "<code>1</code> — одна ссылка\n"
+        "<code>2</code> — две (ПК и Телефон)\n"
         "<code>0</code> — без ссылок" + post_cancel_hint(),
         parse_mode="HTML",
     )
 
 
-# ── Шаг 5: Количество кнопок ──
+# ── Шаг 5: Количество ссылок ──
 @router.message(PostState.waiting_download_count)
 async def post_download_count(msg: types.Message, state: FSMContext):
     if msg.text and msg.text.startswith("/"):
         return
-
     text = (msg.text or "1").strip()
     if text == "-":
         text = "0"
-
     try:
         count = int(text)
     except ValueError:
         return await msg.answer("❌ Введите число.")
-
     if count < 0:
         count = 0
     if count > 10:
-        return await msg.answer("❌ Максимум 10 ссылок.")
+        return await msg.answer("❌ Максимум 10.")
 
     if count == 0:
         await state.update_data(download_buttons=[], download_count=0)
-        await state.set_state(PostState.waiting_media)
+        await state.set_state(PostState.waiting_bottom_text)
         await msg.answer(
-            "🖼 <b>Шаг 6/7 — Медиа</b>\n\n"
-            "Отправьте <b>фото</b> или <b>видео</b> для поста.\n"
-            "Отправьте <code>-</code> чтобы пропустить.",
+            "💬 <b>Шаг 6/8 — Нижний текст</b>\n\n"
+            "Введите текст который будет внизу поста:" + post_cancel_hint(),
             parse_mode="HTML",
         )
         return
 
-    await state.update_data(
-        download_count=count,
-        download_buttons=[],
-        current_btn=0,
-    )
+    await state.update_data(download_count=count, download_buttons=[], current_btn=0)
     await state.set_state(PostState.waiting_download_name)
     await msg.answer(
         f"📥 <b>Ссылка 1/{count} — Название</b>\n\n"
-        f"Введите название для ссылки:\n\n"
+        f"Введите название:\n\n"
         f"<i>Пример:</i> <code>Скачать на ПК</code>",
         parse_mode="HTML",
     )
@@ -747,7 +718,6 @@ async def post_download_count(msg: types.Message, state: FSMContext):
 async def post_download_name(msg: types.Message, state: FSMContext):
     if msg.text and msg.text.startswith("/"):
         return
-
     name = (msg.text or "Скачать").strip()
     data = await state.get_data()
     current = data.get("current_btn", 0) + 1
@@ -757,14 +727,14 @@ async def post_download_name(msg: types.Message, state: FSMContext):
     await state.set_state(PostState.waiting_download_file)
     await msg.answer(
         f"📥 <b>Ссылка {current}/{total} — «{name}»</b>\n\n"
-        f"Теперь отправьте:\n"
-        f"• 📎 <b>Файл</b> — сохранится в бота, ссылка создастся автоматически\n"
-        f"• 🔗 <b>Ссылку</b> — текстом (https://...)\n",
+        f"Отправьте:\n"
+        f"• 📎 <b>Файл</b> — сохранится в бота, ссылка автоматически\n"
+        f"• 🔗 <b>Ссылку</b> — текстом (https://...)",
         parse_mode="HTML",
     )
 
 
-# ── Шаг 5.6: Файл или ссылка для кнопки ──
+# ── Шаг 5.6: Файл или ссылка ──
 @router.message(PostState.waiting_download_file)
 async def post_download_file(msg: types.Message, state: FSMContext):
     if msg.text and msg.text.startswith("/"):
@@ -778,32 +748,24 @@ async def post_download_file(msg: types.Message, state: FSMContext):
 
     url = None
 
-    # Проверяем — это файл?
     fid, ftype, fname = extract_file_info(msg)
     if fid:
-        # Сохраняем файл в БД
         role = await get_role(msg.from_user.id)
         code, link = await save_file_to_db(msg, role)
         if code and link:
             url = link
             await msg.answer(
-                f"✅ Файл <b>{fname}</b> сохранён!\n"
-                f"🔑 Код: <code>{code}</code>",
+                f"✅ Файл <b>{fname}</b> сохранён!\n🔑 Код: <code>{code}</code>",
                 parse_mode="HTML",
             )
         else:
-            return await msg.answer("❌ Ошибка сохранения файла. Попробуйте снова.")
-
-    # Или это ссылка текстом?
+            return await msg.answer("❌ Ошибка сохранения. Попробуйте снова.")
     elif msg.text:
         text = msg.text.strip()
         if text.startswith("http://") or text.startswith("https://"):
             url = text
         else:
-            return await msg.answer(
-                "❌ Отправьте файл или ссылку (https://...)",
-                parse_mode="HTML",
-            )
+            return await msg.answer("❌ Отправьте файл или ссылку (https://...)")
     else:
         return await msg.answer("❌ Отправьте файл или ссылку.")
 
@@ -811,11 +773,10 @@ async def post_download_file(msg: types.Message, state: FSMContext):
     await state.update_data(download_buttons=buttons, current_btn=current)
 
     if current >= total:
-        await state.set_state(PostState.waiting_media)
+        await state.set_state(PostState.waiting_bottom_text)
         await msg.answer(
-            "🖼 <b>Шаг 6/7 — Медиа</b>\n\n"
-            "Отправьте <b>фото</b> или <b>видео</b> для поста.\n"
-            "Отправьте <code>-</code> чтобы пропустить.",
+            "💬 <b>Шаг 6/8 — Нижний текст</b>\n\n"
+            "Введите текст который будет внизу поста:" + post_cancel_hint(),
             parse_mode="HTML",
         )
     else:
@@ -823,17 +784,31 @@ async def post_download_file(msg: types.Message, state: FSMContext):
         await state.set_state(PostState.waiting_download_name)
         await msg.answer(
             f"📥 <b>Ссылка {next_num}/{total} — Название</b>\n\n"
-            f"Введите название для ссылки:",
+            f"Введите название:",
             parse_mode="HTML",
         )
 
 
-# ── Шаг 6: Медиа ──
+# ── Шаг 6: Нижний текст ──
+@router.message(PostState.waiting_bottom_text)
+async def post_bottom_text(msg: types.Message, state: FSMContext):
+    if msg.text and msg.text.startswith("/"):
+        return
+    await state.update_data(bottom_text=msg.text or "-")
+    await state.set_state(PostState.waiting_media)
+    await msg.answer(
+        "🖼 <b>Шаг 7/8 — Медиа</b>\n\n"
+        "Отправьте <b>фото</b> или <b>видео</b> для поста.\n"
+        "Отправьте <code>-</code> чтобы пропустить.",
+        parse_mode="HTML",
+    )
+
+
+# ── Шаг 7: Медиа ──
 @router.message(PostState.waiting_media)
 async def post_media(msg: types.Message, state: FSMContext):
     if msg.text and msg.text.startswith("/"):
         return
-
     if msg.text and msg.text.strip() == "-":
         await state.update_data(media_type=None, media_id=None)
     elif msg.photo:
@@ -841,14 +816,11 @@ async def post_media(msg: types.Message, state: FSMContext):
     elif msg.video:
         await state.update_data(media_type="video", media_id=msg.video.file_id)
     else:
-        return await msg.answer(
-            "❌ Отправьте фото, видео или <code>-</code>",
-            parse_mode="HTML",
-        )
+        return await msg.answer("❌ Отправьте фото, видео или <code>-</code>", parse_mode="HTML")
 
     await state.set_state(PostState.waiting_channel)
     await msg.answer(
-        "📢 <b>Шаг 7/7 — Канал</b>\n\n"
+        "📢 <b>Шаг 8/8 — Канал</b>\n\n"
         "Введите ID канала куда отправить пост:\n"
         "<code>-100123456789</code>\n\n"
         "💡 Бот должен быть админом канала с правом публикации",
@@ -856,26 +828,22 @@ async def post_media(msg: types.Message, state: FSMContext):
     )
 
 
-# ── Шаг 7: Канал ──
+# ── Шаг 8: Канал ──
 @router.message(PostState.waiting_channel)
 async def post_channel(msg: types.Message, state: FSMContext):
     if msg.text and msg.text.startswith("/"):
         return
-
     text = (msg.text or "").strip()
-
     try:
         target_channel = int(text)
     except ValueError:
         return await msg.answer(
-            "❌ ID канала должен быть числом.\n"
-            "<i>Пример:</i> <code>-100123456789</code>",
+            "❌ ID канала должен быть числом.\n<i>Пример:</i> <code>-100123456789</code>",
             parse_mode="HTML",
         )
 
     await state.update_data(target_channel=target_channel)
 
-    # Предпросмотр
     data = await state.get_data()
     post_text = build_post_text(data)
 
@@ -907,10 +875,8 @@ async def post_channel(msg: types.Message, state: FSMContext):
     if media_type == "photo" and media_id:
         try:
             await msg.answer_photo(
-                photo=media_id,
-                caption=preview,
-                parse_mode="HTML",
-                reply_markup=confirm_kb,
+                photo=media_id, caption=preview,
+                parse_mode="HTML", reply_markup=confirm_kb,
             )
             return
         except Exception:
@@ -918,10 +884,8 @@ async def post_channel(msg: types.Message, state: FSMContext):
     elif media_type == "video" and media_id:
         try:
             await msg.answer_video(
-                video=media_id,
-                caption=preview,
-                parse_mode="HTML",
-                reply_markup=confirm_kb,
+                video=media_id, caption=preview,
+                parse_mode="HTML", reply_markup=confirm_kb,
             )
             return
         except Exception:
@@ -947,24 +911,18 @@ async def post_confirm_handler(call: types.CallbackQuery, state: FSMContext):
     try:
         if media_type == "photo" and media_id:
             await bot.send_photo(
-                chat_id=target_channel,
-                photo=media_id,
-                caption=post_text,
-                parse_mode="HTML",
+                chat_id=target_channel, photo=media_id,
+                caption=post_text, parse_mode="HTML",
             )
         elif media_type == "video" and media_id:
             await bot.send_video(
-                chat_id=target_channel,
-                video=media_id,
-                caption=post_text,
-                parse_mode="HTML",
+                chat_id=target_channel, video=media_id,
+                caption=post_text, parse_mode="HTML",
             )
         else:
             await bot.send_message(
-                chat_id=target_channel,
-                text=post_text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
+                chat_id=target_channel, text=post_text,
+                parse_mode="HTML", disable_web_page_preview=True,
             )
 
         await call.message.edit_reply_markup(reply_markup=None)
@@ -985,7 +943,6 @@ async def post_confirm_handler(call: types.CallbackQuery, state: FSMContext):
                 )
             except Exception:
                 pass
-
     except Exception as e:
         logging.error(f"Post send error: {e}")
         await call.message.answer(
@@ -1021,24 +978,18 @@ async def post_test_handler(call: types.CallbackQuery, state: FSMContext):
     try:
         if media_type == "photo" and media_id:
             await bot.send_photo(
-                chat_id=call.from_user.id,
-                photo=media_id,
-                caption=post_text,
-                parse_mode="HTML",
+                chat_id=call.from_user.id, photo=media_id,
+                caption=post_text, parse_mode="HTML",
             )
         elif media_type == "video" and media_id:
             await bot.send_video(
-                chat_id=call.from_user.id,
-                video=media_id,
-                caption=post_text,
-                parse_mode="HTML",
+                chat_id=call.from_user.id, video=media_id,
+                caption=post_text, parse_mode="HTML",
             )
         else:
             await bot.send_message(
-                chat_id=call.from_user.id,
-                text=post_text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
+                chat_id=call.from_user.id, text=post_text,
+                parse_mode="HTML", disable_web_page_preview=True,
             )
         await call.answer("✅ Тестовый пост отправлен вам!")
     except Exception as e:
@@ -1059,8 +1010,7 @@ async def cmd_setadmin(msg: types.Message):
         return await msg.answer(
             "📝 <b>Формат:</b>\n"
             "/setadmin <code>user_id</code> <code>senior/middle/junior</code>\n\n"
-            "<b>Пример:</b>\n"
-            "/setadmin 123456789 junior",
+            "<b>Пример:</b>\n/setadmin 123456789 junior",
             parse_mode="HTML",
         )
 
@@ -1080,10 +1030,8 @@ async def cmd_setadmin(msg: types.Message):
         )
 
     new_role = ROLE_COMMANDS[role_name]
-
     if target_id == OWNER_ID:
         return await msg.answer("⛔ Нельзя изменить роль владельца.")
-
     if new_role >= caller_role and caller_role < 4:
         return await msg.answer("⛔ Нельзя назначить роль равную или выше своей.")
 
@@ -1098,7 +1046,6 @@ async def cmd_setadmin(msg: types.Message):
         username = str(target_id)
 
     await set_admin(target_id, new_role, username)
-
     await msg.answer(
         f"✅ <b>Админ назначен!</b>\n\n"
         f"👤 {username} (ID: <code>{target_id}</code>)\n"
@@ -1126,10 +1073,7 @@ async def cmd_removeadmin(msg: types.Message):
 
     parts = msg.text.split()
     if len(parts) < 2:
-        return await msg.answer(
-            "📝 <b>Формат:</b> /removeadmin <code>user_id</code>",
-            parse_mode="HTML",
-        )
+        return await msg.answer("📝 <b>Формат:</b> /removeadmin <code>user_id</code>", parse_mode="HTML")
 
     try:
         target_id = int(parts[1])
@@ -1153,34 +1097,21 @@ async def cmd_removeadmin(msg: types.Message):
         caller_name = get_username_display(msg.from_user)
         buttons = InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text="✅ Разрешить",
-                    callback_data=f"approve_remove:{target_id}:{msg.from_user.id}"
-                ),
-                InlineKeyboardButton(
-                    text="❌ Отклонить",
-                    callback_data=f"deny_remove:{target_id}:{msg.from_user.id}"
-                ),
+                InlineKeyboardButton(text="✅ Разрешить", callback_data=f"approve_remove:{target_id}:{msg.from_user.id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"deny_remove:{target_id}:{msg.from_user.id}"),
             ]
         ])
-
         await bot.send_message(
             OWNER_ID,
             f"⚠️ <b>Запрос на снятие админа</b>\n\n"
-            f"{ROLES[caller_role]} {caller_name}\n"
-            f"хочет снять {ROLES[target_role]} админа\n"
+            f"{ROLES[caller_role]} {caller_name}\nхочет снять {ROLES[target_role]} админа\n"
             f"👤 {target_username} (ID: {target_id})",
-            parse_mode="HTML",
-            reply_markup=buttons,
+            parse_mode="HTML", reply_markup=buttons,
         )
         return await msg.answer("📨 Запрос отправлен владельцу.")
 
     await remove_admin(target_id)
-    await msg.answer(
-        f"✅ {ROLES[target_role]} {target_username} снят с должности.",
-        parse_mode="HTML",
-    )
-
+    await msg.answer(f"✅ {ROLES[target_role]} {target_username} снят с должности.", parse_mode="HTML")
     try:
         await bot.send_message(target_id, "❌ <b>Вы сняты с должности админа.</b>", parse_mode="HTML")
     except Exception:
@@ -1195,10 +1126,7 @@ async def cmd_demote(msg: types.Message):
 
     parts = msg.text.split()
     if len(parts) < 2:
-        return await msg.answer(
-            "📝 <b>Формат:</b> /demote <code>user_id</code>",
-            parse_mode="HTML",
-        )
+        return await msg.answer("📝 <b>Формат:</b> /demote <code>user_id</code>", parse_mode="HTML")
 
     try:
         target_id = int(parts[1])
@@ -1217,7 +1145,6 @@ async def cmd_demote(msg: types.Message):
 
     if target_role <= 1:
         return await msg.answer("❌ Уже минимальная роль. Используйте /removeadmin")
-
     if not can_manage(caller_role, target_role) and caller_role < 4:
         return await msg.answer("⛔ Нельзя понизить админа с ролью равной или выше вашей.")
 
@@ -1227,40 +1154,23 @@ async def cmd_demote(msg: types.Message):
         caller_name = get_username_display(msg.from_user)
         buttons = InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text="✅ Разрешить",
-                    callback_data=f"approve_demote:{target_id}:{new_role}:{msg.from_user.id}"
-                ),
-                InlineKeyboardButton(
-                    text="❌ Отклонить",
-                    callback_data=f"deny_demote:{target_id}:{msg.from_user.id}"
-                ),
+                InlineKeyboardButton(text="✅ Разрешить", callback_data=f"approve_demote:{target_id}:{new_role}:{msg.from_user.id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"deny_demote:{target_id}:{msg.from_user.id}"),
             ]
         ])
-
         await bot.send_message(
             OWNER_ID,
             f"⚠️ <b>Запрос на понижение</b>\n\n"
-            f"{ROLES[caller_role]} {caller_name}\n"
-            f"хочет понизить {target_username}\n"
+            f"{ROLES[caller_role]} {caller_name}\nхочет понизить {target_username}\n"
             f"{ROLES[target_role]} → {ROLES[new_role]}",
-            parse_mode="HTML",
-            reply_markup=buttons,
+            parse_mode="HTML", reply_markup=buttons,
         )
         return await msg.answer("📨 Запрос отправлен владельцу.")
 
     await set_admin(target_id, new_role, target_username)
-    await msg.answer(
-        f"⬇️ {target_username} понижен: {ROLES[target_role]} → {ROLES[new_role]}",
-        parse_mode="HTML",
-    )
-
+    await msg.answer(f"⬇️ {target_username} понижен: {ROLES[target_role]} → {ROLES[new_role]}", parse_mode="HTML")
     try:
-        await bot.send_message(
-            target_id,
-            f"⬇️ <b>Вы понижены:</b> {ROLES[target_role]} → {ROLES[new_role]}",
-            parse_mode="HTML",
-        )
+        await bot.send_message(target_id, f"⬇️ <b>Вы понижены:</b> {ROLES[target_role]} → {ROLES[new_role]}", parse_mode="HTML")
     except Exception:
         pass
 
@@ -1272,10 +1182,8 @@ async def cmd_resign(msg: types.Message):
         return await msg.answer("❌ Вы не админ.")
     if msg.from_user.id == OWNER_ID:
         return await msg.answer("⛔ Владелец не может снять себя.")
-
     await remove_admin(msg.from_user.id)
     await msg.answer("✅ Вы сняли с себя админку.")
-
     try:
         await bot.send_message(
             OWNER_ID,
@@ -1291,22 +1199,16 @@ async def cmd_admins(msg: types.Message):
     role = await get_role(msg.from_user.id)
     if role < 2:
         return await msg.answer("⛔ Недостаточно прав.")
-
     admins = await get_all_admins()
     if not admins:
         return await msg.answer("📋 Админов нет.")
-
     lines = [f"👑 <b>Владелец:</b> ID <code>{OWNER_ID}</code>\n"]
     for a in admins:
         r = a.get("role", 0)
         u = a.get("username", "?")
         uid = a.get("user_id", "?")
         lines.append(f"{ROLES.get(r, '?')} {u} (ID: <code>{uid}</code>)")
-
-    await msg.answer(
-        f"📋 <b>Список админов:</b>\n\n" + "\n".join(lines),
-        parse_mode="HTML",
-    )
+    await msg.answer(f"📋 <b>Список админов:</b>\n\n" + "\n".join(lines), parse_mode="HTML")
 
 
 @router.message(Command("adminstats"))
@@ -1314,7 +1216,6 @@ async def cmd_adminstats(msg: types.Message):
     role = await get_role(msg.from_user.id)
     if role < 3:
         return await msg.answer("⛔ Недостаточно прав.")
-
     rows = await db_all()
     stats = {}
     for e in rows:
@@ -1324,10 +1225,8 @@ async def cmd_adminstats(msg: types.Message):
             stats[uid] = {"name": name, "files": 0, "downloads": 0}
         stats[uid]["files"] += 1
         stats[uid]["downloads"] += e.get("downloads") or 0
-
     if not stats:
         return await msg.answer("📊 Нет данных.")
-
     lines = []
     sorted_stats = sorted(stats.items(), key=lambda x: x[1]["files"], reverse=True)
     for uid, s in sorted_stats:
@@ -1336,7 +1235,6 @@ async def cmd_adminstats(msg: types.Message):
             f"👤 <b>{s['name']}</b> ({ROLES.get(r, '?')})\n"
             f"   📁 Файлов: {s['files']} | 📥 Скачиваний: {s['downloads']}"
         )
-
     text = f"📊 <b>Статистика по админам:</b>\n\n" + "\n\n".join(lines)
     for i in range(0, len(text), 4000):
         await msg.answer(text[i:i + 4000], parse_mode="HTML")
@@ -1349,16 +1247,11 @@ async def cmd_adminstats(msg: types.Message):
 async def approve_remove(call: types.CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return await call.answer("⛔ Только владелец.", show_alert=True)
-
     parts = call.data.split(":")
     target_id = int(parts[1])
     requester_id = int(parts[2])
-
     await remove_admin(target_id)
-    await call.message.edit_text(
-        call.message.text + "\n\n✅ <b>ОДОБРЕНО</b>", parse_mode="HTML",
-    )
-
+    await call.message.edit_text(call.message.text + "\n\n✅ <b>ОДОБРЕНО</b>", parse_mode="HTML")
     try:
         await bot.send_message(target_id, "❌ <b>Вы сняты с должности админа.</b>", parse_mode="HTML")
     except Exception:
@@ -1374,14 +1267,9 @@ async def approve_remove(call: types.CallbackQuery):
 async def deny_remove(call: types.CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return await call.answer("⛔ Только владелец.", show_alert=True)
-
     parts = call.data.split(":")
     requester_id = int(parts[2])
-
-    await call.message.edit_text(
-        call.message.text + "\n\n❌ <b>ОТКЛОНЕНО</b>", parse_mode="HTML",
-    )
-
+    await call.message.edit_text(call.message.text + "\n\n❌ <b>ОТКЛОНЕНО</b>", parse_mode="HTML")
     try:
         await bot.send_message(requester_id, "❌ Ваш запрос отклонён владельцем.")
     except Exception:
@@ -1393,20 +1281,14 @@ async def deny_remove(call: types.CallbackQuery):
 async def approve_demote(call: types.CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return await call.answer("⛔ Только владелец.", show_alert=True)
-
     parts = call.data.split(":")
     target_id = int(parts[1])
     new_role = int(parts[2])
     requester_id = int(parts[3])
-
     target_info = await get_admin_info(target_id)
     username = target_info.get("username", str(target_id)) if target_info else str(target_id)
-
     await set_admin(target_id, new_role, username)
-    await call.message.edit_text(
-        call.message.text + "\n\n✅ <b>ОДОБРЕНО</b>", parse_mode="HTML",
-    )
-
+    await call.message.edit_text(call.message.text + "\n\n✅ <b>ОДОБРЕНО</b>", parse_mode="HTML")
     try:
         await bot.send_message(target_id, f"⬇️ <b>Вы понижены до:</b> {ROLES[new_role]}", parse_mode="HTML")
     except Exception:
@@ -1422,14 +1304,9 @@ async def approve_demote(call: types.CallbackQuery):
 async def deny_demote(call: types.CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return await call.answer("⛔ Только владелец.", show_alert=True)
-
     parts = call.data.split(":")
     requester_id = int(parts[-1])
-
-    await call.message.edit_text(
-        call.message.text + "\n\n❌ <b>ОТКЛОНЕНО</b>", parse_mode="HTML",
-    )
-
+    await call.message.edit_text(call.message.text + "\n\n❌ <b>ОТКЛОНЕНО</b>", parse_mode="HTML")
     try:
         await bot.send_message(requester_id, "❌ Ваш запрос отклонён владельцем.")
     except Exception:
@@ -1445,36 +1322,26 @@ async def cmd_ban(msg: types.Message):
     role = await get_role(msg.from_user.id)
     if role < 3:
         return await msg.answer("⛔ Недостаточно прав.")
-
     parts = msg.text.split(maxsplit=2)
     if len(parts) < 2:
         return await msg.answer("📝 <b>Формат:</b> /ban <code>user_id</code> [причина]", parse_mode="HTML")
-
     try:
         target_id = int(parts[1])
     except ValueError:
         return await msg.answer("❌ user_id должен быть числом.")
-
     if target_id == OWNER_ID:
         return await msg.answer("⛔ Нельзя забанить владельца.")
-
     target_role = await get_role(target_id)
     if target_role >= role:
         return await msg.answer("⛔ Нельзя забанить админа с ролью равной или выше.")
-
     if await is_banned(target_id):
         return await msg.answer("❌ Уже забанен.")
-
     reason = parts[2] if len(parts) > 2 else "Не указана"
     await add_ban(target_id, reason, msg.from_user.id)
-
     await msg.answer(
-        f"🚫 <b>Забанен</b>\n\n"
-        f"👤 ID: <code>{target_id}</code>\n"
-        f"📝 Причина: {reason}",
+        f"🚫 <b>Забанен</b>\n\n👤 ID: <code>{target_id}</code>\n📝 Причина: {reason}",
         parse_mode="HTML",
     )
-
     try:
         await bot.send_message(target_id, f"🚫 <b>Вы заблокированы</b>\n📝 Причина: {reason}", parse_mode="HTML")
     except Exception:
@@ -1486,22 +1353,17 @@ async def cmd_unban(msg: types.Message):
     role = await get_role(msg.from_user.id)
     if role < 3:
         return await msg.answer("⛔ Недостаточно прав.")
-
     parts = msg.text.split()
     if len(parts) < 2:
         return await msg.answer("📝 <b>Формат:</b> /unban <code>user_id</code>", parse_mode="HTML")
-
     try:
         target_id = int(parts[1])
     except ValueError:
         return await msg.answer("❌ user_id должен быть числом.")
-
     if not await is_banned(target_id):
         return await msg.answer("❌ Не забанен.")
-
     await remove_ban(target_id)
     await msg.answer(f"✅ <code>{target_id}</code> разбанен.", parse_mode="HTML")
-
     try:
         await bot.send_message(target_id, "✅ <b>Вы разблокированы!</b>", parse_mode="HTML")
     except Exception:
@@ -1515,23 +1377,18 @@ async def cmd_unban(msg: types.Message):
 async def cmd_sub(msg: types.Message):
     if msg.from_user.id != OWNER_ID:
         return await msg.answer("⛔ Только владелец.")
-
     global sub_required
     sub_required = not sub_required
     if sub_required:
-        await msg.answer(
-            f"✅ <b>Обязательная подписка ВКЛЮЧЕНА</b>\n\nКанал: {CHANNEL_LINK}",
-            parse_mode="HTML",
-        )
+        await msg.answer(f"✅ <b>Подписка ВКЛЮЧЕНА</b>\n\nКанал: {CHANNEL_LINK}", parse_mode="HTML")
     else:
-        await msg.answer("❌ <b>Обязательная подписка ВЫКЛЮЧЕНА</b>", parse_mode="HTML")
+        await msg.answer("❌ <b>Подписка ВЫКЛЮЧЕНА</b>", parse_mode="HTML")
 
 
 @router.message(Command("notify"))
 async def cmd_notify(msg: types.Message):
     if msg.from_user.id != OWNER_ID:
         return await msg.answer("⛔ Только владелец.")
-
     global notify_uploads
     notify_uploads = not notify_uploads
     status = "✅ ВКЛ" if notify_uploads else "❌ ВЫКЛ"
@@ -1545,13 +1402,10 @@ async def cmd_notify(msg: types.Message):
 async def cmd_send(msg: types.Message, state: FSMContext):
     if msg.from_user.id != OWNER_ID:
         return await msg.answer("⛔ Только владелец.")
-
     users = await count_users()
     await state.set_state(BroadcastState.waiting_message)
     await msg.answer(
-        f"📢 <b>Рассылка</b>\n\n"
-        f"👥 Получателей: <b>{users}</b>\n\n"
-        f"Отправьте сообщение.\n/cancel — отмена",
+        f"📢 <b>Рассылка</b>\n\n👥 Получателей: <b>{users}</b>\n\nОтправьте сообщение.\n/cancel — отмена",
         parse_mode="HTML",
     )
 
@@ -1573,16 +1427,13 @@ async def cmd_cancel(msg: types.Message, state: FSMContext):
 async def do_broadcast(msg: types.Message, state: FSMContext):
     if msg.from_user.id != OWNER_ID:
         return
-
     await state.clear()
     user_ids = await get_all_users()
     total = len(user_ids)
     if total == 0:
         return await msg.answer("👥 Нет пользователей.")
-
     status = await msg.answer(f"📢 Рассылка... 0/{total}")
     sent = failed = blocked = 0
-
     for uid in user_ids:
         try:
             await msg.copy_to(chat_id=uid)
@@ -1593,25 +1444,18 @@ async def do_broadcast(msg: types.Message, state: FSMContext):
                 blocked += 1
             else:
                 failed += 1
-
         done = sent + failed + blocked
         if done % 25 == 0:
             await asyncio.sleep(1)
         if done % 50 == 0:
             try:
-                await status.edit_text(
-                    f"📢 Рассылка... {done}/{total}\n"
-                    f"✅{sent} 🚫{blocked} ❌{failed}"
-                )
+                await status.edit_text(f"📢 Рассылка... {done}/{total}\n✅{sent} 🚫{blocked} ❌{failed}")
             except Exception:
                 pass
-
     await status.edit_text(
         f"✅ <b>Рассылка завершена!</b>\n\n"
-        f"👥 Всего: <b>{total}</b>\n"
-        f"✅ Доставлено: <b>{sent}</b>\n"
-        f"🚫 Заблокировали: <b>{blocked}</b>\n"
-        f"❌ Ошибки: <b>{failed}</b>",
+        f"👥 Всего: <b>{total}</b>\n✅ Доставлено: <b>{sent}</b>\n"
+        f"🚫 Заблокировали: <b>{blocked}</b>\n❌ Ошибки: <b>{failed}</b>",
         parse_mode="HTML",
     )
 
@@ -1622,34 +1466,25 @@ async def do_broadcast(msg: types.Message, state: FSMContext):
 @router.message(F.content_type.in_(MEDIA_TYPES))
 async def save_file_handler(msg: types.Message, state: FSMContext):
     role = await get_role(msg.from_user.id)
-
     if role < 1:
         return await msg.answer("⛔ Только админы могут добавлять файлы.")
 
     current = await state.get_state()
-
-    # Если в режиме рассылки — пропускаем
     if current == BroadcastState.waiting_message:
         return
-
-    # Если ждём медиа для поста — обрабатывается post_media
     if current == PostState.waiting_media:
         return
-
-    # Если ждём файл для кнопки скачивания — обрабатывается post_download_file
     if current == PostState.waiting_download_file:
         return
 
     code, link = await save_file_to_db(msg, role)
     if not code:
         return await msg.answer("❌ Не удалось определить тип файла.")
-
     entry_name = extract_file_info(msg)[2] or "file"
 
     await msg.reply(
         f"✅ <b>Файл сохранён!</b>\n\n"
-        f"📁 <b>{entry_name}</b>\n"
-        f"🔑 Код: <code>{code}</code>\n"
+        f"📁 <b>{entry_name}</b>\n🔑 Код: <code>{code}</code>\n"
         f"👤 Загрузил: {get_username_display(msg.from_user)} ({ROLES[role]})\n\n"
         f"🔗 Ссылка:\n<code>{link}</code>",
         parse_mode="HTML",
@@ -1659,11 +1494,8 @@ async def save_file_handler(msg: types.Message, state: FSMContext):
         try:
             await bot.send_message(
                 OWNER_ID,
-                f"📤 <b>Новый файл</b>\n\n"
-                f"👤 {get_username_display(msg.from_user)} ({ROLES[role]})\n"
-                f"📁 {entry_name}\n"
-                f"🔑 <code>{code}</code>\n"
-                f"🔗 {link}",
+                f"📤 <b>Новый файл</b>\n\n👤 {get_username_display(msg.from_user)} ({ROLES[role]})\n"
+                f"📁 {entry_name}\n🔑 <code>{code}</code>\n🔗 {link}",
                 parse_mode="HTML",
             )
         except Exception:
@@ -1678,22 +1510,14 @@ async def cmd_find(msg: types.Message):
     role = await get_role(msg.from_user.id)
     if role < 1:
         return await msg.answer("⛔ Недостаточно прав.")
-
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
         return await msg.answer("📝 <b>Формат:</b> /find <code>название</code>", parse_mode="HTML")
-
     query = parts[1].strip().lower()
     rows = await db_all()
-    found = [
-        e for e in rows
-        if query in (e.get("name") or "").lower()
-        or query in (e.get("caption") or "").lower()
-    ]
-
+    found = [e for e in rows if query in (e.get("name") or "").lower() or query in (e.get("caption") or "").lower()]
     if not found:
         return await msg.answer(f"🔍 Ничего не найдено по «{query}»")
-
     lines = []
     for e in found:
         link = f"https://t.me/{BOT_USER}?start={e['code']}"
@@ -1702,10 +1526,8 @@ async def cmd_find(msg: types.Message):
         downloads = e.get("downloads") or 0
         lines.append(
             f"📁 <b>{e.get('name', '?')}</b> 📥{downloads}\n"
-            f"   👤 {uploader} ({ROLES.get(up_role, '?')})\n"
-            f"   <code>{e['code']}</code>\n   {link}"
+            f"   👤 {uploader} ({ROLES.get(up_role, '?')})\n   <code>{e['code']}</code>\n   {link}"
         )
-
     text = f"🔍 <b>Найдено ({len(found)}):</b>\n\n" + "\n\n".join(lines)
     for i in range(0, len(text), 4000):
         await msg.answer(text[i:i + 4000], parse_mode="HTML", disable_web_page_preview=True)
@@ -1716,32 +1538,23 @@ async def cmd_info(msg: types.Message):
     role = await get_role(msg.from_user.id)
     if role < 1:
         return await msg.answer("⛔ Недостаточно прав.")
-
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
         return await msg.answer("📝 <b>Формат:</b> /info <code>код</code>", parse_mode="HTML")
-
     code = parts[1].strip()
     entry = await db_get(code)
     if not entry:
         return await msg.answer("❌ Не найдено.")
-
     up_role = entry.get("uploader_role") or 0
     downloads = entry.get("downloads") or 0
     created = (entry.get("created_at") or "?")[:10]
     link = f"https://t.me/{BOT_USER}?start={code}"
-
     await msg.answer(
         f"📋 <b>Информация о файле</b>\n\n"
-        f"📁 Имя: <b>{entry.get('name', '?')}</b>\n"
-        f"📝 Тип: <b>{entry.get('type', '?')}</b>\n"
-        f"💬 Подпись: <b>{entry.get('caption') or '—'}</b>\n"
-        f"📥 Скачиваний: <b>{downloads}</b>\n"
-        f"👤 Загрузил: <b>{entry.get('uploader_name', '?')}</b>\n"
-        f"📋 Роль: <b>{ROLES.get(up_role, '?')}</b>\n"
-        f"📅 Дата: <b>{created}</b>\n"
-        f"🔑 Код: <code>{code}</code>\n\n"
-        f"🔗 Ссылка:\n<code>{link}</code>",
+        f"📁 Имя: <b>{entry.get('name', '?')}</b>\n📝 Тип: <b>{entry.get('type', '?')}</b>\n"
+        f"💬 Подпись: <b>{entry.get('caption') or '—'}</b>\n📥 Скачиваний: <b>{downloads}</b>\n"
+        f"👤 Загрузил: <b>{entry.get('uploader_name', '?')}</b>\n📋 Роль: <b>{ROLES.get(up_role, '?')}</b>\n"
+        f"📅 Дата: <b>{created}</b>\n🔑 Код: <code>{code}</code>\n\n🔗 Ссылка:\n<code>{link}</code>",
         parse_mode="HTML",
     )
 
@@ -1751,29 +1564,18 @@ async def cmd_rename(msg: types.Message):
     role = await get_role(msg.from_user.id)
     if role < 1:
         return await msg.answer("⛔ Недостаточно прав.")
-
     parts = msg.text.split(maxsplit=2)
     if len(parts) < 3:
-        return await msg.answer(
-            "📝 <b>Формат:</b> /rename <code>код</code> <code>новое имя</code>",
-            parse_mode="HTML",
-        )
-
+        return await msg.answer("📝 <b>Формат:</b> /rename <code>код</code> <code>новое имя</code>", parse_mode="HTML")
     code = parts[1].strip()
     new_name = parts[2].strip()
-
     entry = await db_get(code)
     if not entry:
         return await msg.answer("❌ Не найдено.")
-
     if not can_delete_file(role, msg.from_user.id, entry):
         return await msg.answer("⛔ Нет прав.")
-
     await db_rename(code, new_name)
-    await msg.answer(
-        f"✅ <b>Переименовано:</b>\n📁 {entry.get('name', '?')} → <b>{new_name}</b>",
-        parse_mode="HTML",
-    )
+    await msg.answer(f"✅ <b>Переименовано:</b>\n📁 {entry.get('name', '?')} → <b>{new_name}</b>", parse_mode="HTML")
 
 
 @router.message(Command("myfiles"))
@@ -1781,21 +1583,15 @@ async def cmd_myfiles(msg: types.Message):
     role = await get_role(msg.from_user.id)
     if role < 1:
         return await msg.answer("⛔ Недостаточно прав.")
-
     rows = await db_all()
     my = [e for e in rows if e.get("uploaded_by") == msg.from_user.id]
-
     if not my:
         return await msg.answer("📂 У вас нет файлов.")
-
     lines = []
     for e in my:
         link = f"https://t.me/{BOT_USER}?start={e['code']}"
         downloads = e.get("downloads") or 0
-        lines.append(
-            f"📁 <b>{e.get('name', '?')}</b> 📥{downloads}\n"
-            f"   <code>{e['code']}</code>\n   {link}"
-        )
+        lines.append(f"📁 <b>{e.get('name', '?')}</b> 📥{downloads}\n   <code>{e['code']}</code>\n   {link}")
     text = f"📂 <b>Ваши файлы ({len(my)}):</b>\n\n" + "\n\n".join(lines)
     for i in range(0, len(text), 4000):
         await msg.answer(text[i:i + 4000], parse_mode="HTML", disable_web_page_preview=True)
@@ -1806,11 +1602,9 @@ async def cmd_list(msg: types.Message):
     role = await get_role(msg.from_user.id)
     if role < 1:
         return await msg.answer("⛔ Недостаточно прав.")
-
     rows = await db_all()
     if not rows:
         return await msg.answer("📂 Пусто.")
-
     lines = []
     for e in rows:
         link = f"https://t.me/{BOT_USER}?start={e['code']}"
@@ -1819,8 +1613,7 @@ async def cmd_list(msg: types.Message):
         downloads = e.get("downloads") or 0
         lines.append(
             f"📁 <b>{e.get('name', '?')}</b> 📥{downloads}\n"
-            f"   👤 {uploader} ({ROLES.get(up_role, '?')})\n"
-            f"   <code>{e['code']}</code>\n   {link}"
+            f"   👤 {uploader} ({ROLES.get(up_role, '?')})\n   <code>{e['code']}</code>\n   {link}"
         )
     text = f"📂 <b>Все файлы ({len(rows)}):</b>\n\n" + "\n\n".join(lines)
     for i in range(0, len(text), 4000):
@@ -1832,19 +1625,15 @@ async def cmd_del(msg: types.Message):
     role = await get_role(msg.from_user.id)
     if role < 1:
         return await msg.answer("⛔ Недостаточно прав.")
-
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
         return await msg.answer("📝 <b>Формат:</b> /del <code>код</code>", parse_mode="HTML")
-
     code = parts[1].strip()
     entry = await db_get(code)
     if not entry:
         return await msg.answer("❌ Не найдено.")
-
     if not can_delete_file(role, msg.from_user.id, entry):
         return await msg.answer("⛔ Нет прав.")
-
     await db_delete(code)
     await msg.answer(
         f"🗑 <b>Удалено:</b> {entry.get('name', '?')}\n👤 Загружал: {entry.get('uploader_name', '?')}",
@@ -1857,14 +1646,11 @@ async def cmd_stats(msg: types.Message):
     role = await get_role(msg.from_user.id)
     if role < 1:
         return await msg.answer("⛔ Недостаточно прав.")
-
     rows = await db_all()
     users = await count_users()
     total = len(rows)
     dl = sum(e.get("downloads") or 0 for e in rows)
-
     top = sorted(rows, key=lambda x: x.get("downloads") or 0, reverse=True)[:5]
-
     top_lines = []
     for i, e in enumerate(top, 1):
         downloads = e.get("downloads") or 0
@@ -1872,29 +1658,21 @@ async def cmd_stats(msg: types.Message):
         uploader = e.get("uploader_name", "?")
         up_role = e.get("uploader_role") or 0
         top_lines.append(
-            f"  {i}. 📁 <b>{name}</b> — {downloads} скач.\n"
-            f"      👤 {uploader} ({ROLES.get(up_role, '?')})"
+            f"  {i}. 📁 <b>{name}</b> — {downloads} скач.\n      👤 {uploader} ({ROLES.get(up_role, '?')})"
         )
-
     sub_status = "✅ ВКЛ" if sub_required else "❌ ВЫКЛ"
     notify_status = "✅ ВКЛ" if notify_uploads else "❌ ВЫКЛ"
     admins = await get_all_admins()
-
     text = (
         f"📊 <b>Статистика</b>\n\n"
-        f"📁 Файлов: <b>{total}</b>\n"
-        f"👥 Пользователей: <b>{users}</b>\n"
-        f"📥 Всего скачиваний: <b>{dl}</b>\n"
-        f"👮 Админов: <b>{len(admins)}</b>\n"
-        f"📢 Подписка: <b>{sub_status}</b>\n"
-        f"🔔 Уведомления: <b>{notify_status}</b>"
+        f"📁 Файлов: <b>{total}</b>\n👥 Пользователей: <b>{users}</b>\n"
+        f"📥 Всего скачиваний: <b>{dl}</b>\n👮 Админов: <b>{len(admins)}</b>\n"
+        f"📢 Подписка: <b>{sub_status}</b>\n🔔 Уведомления: <b>{notify_status}</b>"
     )
-
     if top_lines:
         text += f"\n\n🔝 <b>Топ-5:</b>\n" + "\n".join(top_lines)
     else:
         text += "\n\n🔝 <b>Топ-5:</b> пока нет скачиваний"
-
     await msg.answer(text, parse_mode="HTML")
 
 
@@ -1903,12 +1681,10 @@ async def cmd_stats(msg: types.Message):
 async def fallback(msg: types.Message, state: FSMContext):
     if await is_banned(msg.from_user.id):
         return await msg.answer("🚫 Вы заблокированы.")
-
     role = await get_role(msg.from_user.id)
     if role >= 1:
         await msg.answer(
-            "📤 Отправьте файл для сохранения.\n"
-            "Нажмите <b>/</b> для списка команд.",
+            "📤 Отправьте файл для сохранения.\nНажмите <b>/</b> для списка команд.",
             parse_mode="HTML",
         )
     else:
