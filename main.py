@@ -33,7 +33,7 @@ WH_PATH  = f"/wh/{TOKEN}"
 PORT     = int(os.environ.get("PORT", 10000))
 
 CHANNEL_ID   = os.environ.get("CHANNEL_ID", "")
-CHANNEL_LINK = "https://t.me/venoloadertgk"
+CHANNEL_LINK = "https://t.me/qwituxcracksperehod"
 OWNER_LINK   = os.environ.get("OWNER_LINK", "https://t.me/venodev")
 START_PHOTO  = os.environ.get("START_PHOTO", "")
 
