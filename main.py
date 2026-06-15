@@ -39,7 +39,7 @@ START_PHOTO  = os.environ.get("START_PHOTO", "")
 
 # Фиксированный канал для не-владельцев (qwitux cracks)
 QWITUX_CHANNEL_ID    = int(os.environ.get("QWITUX_CHANNEL_ID", "-1003696842795"))
-QWITUX_CHANNEL_TITLE = os.environ.get("QWITUX_CHANNEL_TITLE", "qwitux cracks")
+QWITUX_CHANNEL_TITLE = os.environ.get("QWITUX_CHANNEL_TITLE", "Qwitux Cracks")
 
 sub_required   = True if CHANNEL_ID else False
 notify_uploads = True
@@ -156,24 +156,12 @@ def start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def channels_keyboard(channels: list, is_owner: bool) -> InlineKeyboardMarkup:
-    rows = []
-    if is_owner:
-        seen = set()
-        for ch in channels:
-            cid = ch.get("chat_id")
-            if cid is None or cid in seen:
-                continue
-            seen.add(cid)
-            title = ch.get("title") or str(cid)
-            rows.append([InlineKeyboardButton(text=f"📢 {title}", callback_data=f"postch:{cid}")])
-        if QWITUX_CHANNEL_ID not in seen:
-            rows.insert(0, [InlineKeyboardButton(
-                text=f"📢 {QWITUX_CHANNEL_TITLE}", callback_data=f"postch:{QWITUX_CHANNEL_ID}")])
-    else:
-        rows.append([InlineKeyboardButton(
-            text=f"📢 {QWITUX_CHANNEL_TITLE}", callback_data=f"postch:{QWITUX_CHANNEL_ID}")])
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="post_cancel")])
+def channels_keyboard(channels: list = None, is_owner: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(
+            text=f"📢 {QWITUX_CHANNEL_TITLE}", callback_data=f"postch:{QWITUX_CHANNEL_ID}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="post_cancel")],
+    ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -952,16 +940,15 @@ async def post_media(msg: types.Message, state: FSMContext):
     await state.set_state(PostState.waiting_channel)
 
     is_owner = msg.from_user.id == OWNER_ID
-    channels = await get_all_channels() if is_owner else []
-    kb = channels_keyboard(channels, is_owner)
+    kb = channels_keyboard()
 
     if is_owner:
         hint = (
             "📢 <b>Шаг 8/8 — Канал</b>\n\n"
-            "Выберите канал из списка (каналы, где бот — админ).\n"
-            "Можно также отправить ID канала вручную:\n"
+            "Выберите канал кнопкой ниже.\n"
+            "Либо отправьте ID другого канала вручную:\n"
             "<code>-100123456789</code>\n\n"
-            "💡 Если нужного канала нет в списке — добавьте бота в админы канала."
+            "💡 Бот должен быть админом канала с правом публикации."
         )
     else:
         hint = (
@@ -971,7 +958,7 @@ async def post_media(msg: types.Message, state: FSMContext):
     await msg.answer(hint, parse_mode="HTML", reply_markup=kb)
 
 
-# ── Шаг 8: Выбор канала (кнопкой) ──
+# ── Шаг 8:   ыбор канала (кнопкой) ──
 @router.callback_query(PostState.waiting_channel, F.data.startswith("postch:"))
 async def post_channel_select(call: types.CallbackQuery, state: FSMContext):
     role = await get_role(call.from_user.id)
@@ -1611,7 +1598,7 @@ async def do_broadcast(msg: types.Message, state: FSMContext):
     )
 
 
-# ══════════════════════════════════════════════
+# ════════════════   ═════════════════════════════
 #  ФАЙЛЫ — приём
 # ══════════════════════════════════════════════
 @router.message(F.content_type.in_(MEDIA_TYPES))
