@@ -37,6 +37,10 @@ CHANNEL_LINK = "https://t.me/qwituxcracks"
 OWNER_LINK   = os.environ.get("OWNER_LINK", "https://t.me/venodev")
 START_PHOTO  = os.environ.get("START_PHOTO", "")
 
+# Фиксированный канал для не-владельцев (qwitux cracks)
+QWITUX_CHANNEL_ID    = int(os.environ.get("QWITUX_CHANNEL_ID", "-1003696842795"))
+QWITUX_CHANNEL_TITLE = os.environ.get("QWITUX_CHANNEL_TITLE", "qwitux cracks")
+
 sub_required   = True if CHANNEL_ID else False
 notify_uploads = True
 
@@ -44,6 +48,7 @@ FILES_TABLE  = f"{SUPA_URL}/rest/v1/files"
 USERS_TABLE  = f"{SUPA_URL}/rest/v1/users"
 ADMINS_TABLE = f"{SUPA_URL}/rest/v1/admins"
 BANS_TABLE   = f"{SUPA_URL}/rest/v1/bans"
+CHANNELS_TABLE = f"{SUPA_URL}/rest/v1/channels"
 
 http: ClientSession = None
 
@@ -149,6 +154,27 @@ def start_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💬 Связаться с владельцем", url=OWNER_LINK)],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def channels_keyboard(channels: list, is_owner: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if is_owner:
+        seen = set()
+        for ch in channels:
+            cid = ch.get("chat_id")
+            if cid is None or cid in seen:
+                continue
+            seen.add(cid)
+            title = ch.get("title") or str(cid)
+            rows.append([InlineKeyboardButton(text=f"📢 {title}", callback_data=f"postch:{cid}")])
+        if QWITUX_CHANNEL_ID not in seen:
+            rows.insert(0, [InlineKeyboardButton(
+                text=f"📢 {QWITUX_CHANNEL_TITLE}", callback_data=f"postch:{QWITUX_CHANNEL_ID}")])
+    else:
+        rows.append([InlineKeyboardButton(
+            text=f"📢 {QWITUX_CHANNEL_TITLE}", callback_data=f"postch:{QWITUX_CHANNEL_ID}")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="post_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ══════════════════════════════════════════════
@@ -264,6 +290,37 @@ async def add_ban(user_id: int, reason: str, banned_by: int):
 async def remove_ban(user_id: int):
     async with http.delete(f"{BANS_TABLE}?user_id=eq.{user_id}") as r:
         pass
+
+
+# ══════════════════════════════════════════════
+#  БАЗА ДАННЫХ — каналы (где бот админ)
+# ══════════════════════════════════════════════
+async def save_channel(chat_id: int, title: str):
+    async with http.post(
+        CHANNELS_TABLE,
+        json={"chat_id": chat_id, "title": title},
+        headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+    ) as r:
+        if r.status >= 400:
+            async with http.patch(
+                f"{CHANNELS_TABLE}?chat_id=eq.{chat_id}",
+                json={"title": title},
+            ) as r2:
+                pass
+
+
+async def remove_channel(chat_id: int):
+    async with http.delete(f"{CHANNELS_TABLE}?chat_id=eq.{chat_id}") as r:
+        pass
+
+
+async def get_all_channels():
+    try:
+        async with http.get(f"{CHANNELS_TABLE}?select=*&order=title.asc") as r:
+            data = await r.json()
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
 
 # ══════════════════════════════════════════════
@@ -475,6 +532,57 @@ def build_post_text(data: dict) -> str:
     return "\n\n".join(parts)
 
 
+async def send_post_preview(message: types.Message, data: dict):
+    target_channel = data.get("target_channel")
+    channel_name = data.get("target_channel_name")
+    channel_display = channel_name or f"<code>{target_channel}</code>"
+    post_text = build_post_text(data)
+
+    preview = (
+        f"👀 <b>Предпросмотр поста:</b>\n\n"
+        f"{'─' * 30}\n\n"
+        f"{post_text}\n\n"
+        f"{'─' * 30}\n\n"
+        f"📢 Канал: {channel_display}\n"
+        f"🖼 Медиа: {'✅ Есть' if data.get('media_type') else '❌ Нет'}\n"
+        f"📥 Ссылок: <b>{len(data.get('download_buttons', []))}</b>"
+    )
+
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Отправить", callback_data="post_confirm"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data="post_cancel"),
+        ],
+        [
+            InlineKeyboardButton(text="👀 Тест (себе)", callback_data="post_test"),
+        ],
+    ])
+
+    media_type = data.get("media_type")
+    media_id = data.get("media_id")
+
+    if media_type == "photo" and media_id:
+        try:
+            await message.answer_photo(
+                photo=media_id, caption=preview,
+                parse_mode="HTML", reply_markup=confirm_kb,
+            )
+            return
+        except Exception:
+            pass
+    elif media_type == "video" and media_id:
+        try:
+            await message.answer_video(
+                video=media_id, caption=preview,
+                parse_mode="HTML", reply_markup=confirm_kb,
+            )
+            return
+        except Exception:
+            pass
+
+    await message.answer(preview, parse_mode="HTML", reply_markup=confirm_kb)
+
+
 # ══════════════════════════════════════════════
 #  БОТ
 # ══════════════════════════════════════════════
@@ -590,6 +698,29 @@ async def check_sub_callback(call: types.CallbackQuery):
         logging.error(f"Send error: {e}")
         await call.message.answer("❌ Ошибка отправки.")
     await call.answer()
+
+
+# ══════════════════════════════════════════════
+#  ОТСЛЕЖИВАНИЕ КАНАЛОВ (бот добавлен/удалён как админ)
+# ══════════════════════════════════════════════
+@router.my_chat_member()
+async def on_my_chat_member(update: types.ChatMemberUpdated):
+    chat = update.chat
+    if chat.type not in ("channel", "supergroup", "group"):
+        return
+    try:
+        new_status = update.new_chat_member.status
+    except Exception:
+        return
+    if new_status == ChatMemberStatus.ADMINISTRATOR:
+        await save_channel(chat.id, chat.title or str(chat.id))
+    elif new_status in (
+        ChatMemberStatus.LEFT,
+        ChatMemberStatus.KICKED,
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.RESTRICTED,
+    ):
+        await remove_channel(chat.id)
 
 
 # ══════════════════════════════════════════════
@@ -819,79 +950,92 @@ async def post_media(msg: types.Message, state: FSMContext):
         return await msg.answer("❌ Отправьте фото, видео или <code>-</code>", parse_mode="HTML")
 
     await state.set_state(PostState.waiting_channel)
-    await msg.answer(
-        "📢 <b>Шаг 8/8 — Канал</b>\n\n"
-        "Введите ID канала куда отправить пост:\n"
-        "<code>-100123456789</code>\n\n"
-        "💡 Бот должен быть админом канала с правом публикации",
-        parse_mode="HTML",
-    )
+
+    is_owner = msg.from_user.id == OWNER_ID
+    channels = await get_all_channels() if is_owner else []
+    kb = channels_keyboard(channels, is_owner)
+
+    if is_owner:
+        hint = (
+            "📢 <b>Шаг 8/8 — Канал</b>\n\n"
+            "Выберите канал из списка (каналы, где бот — админ).\n"
+            "Можно также отправить ID канала вручную:\n"
+            "<code>-100123456789</code>\n\n"
+            "💡 Если нужного канала нет в списке — добавьте бота в админы канала."
+        )
+    else:
+        hint = (
+            "📢 <b>Шаг 8/8 — Канал</b>\n\n"
+            "Выберите канал для публикации:"
+        )
+    await msg.answer(hint, parse_mode="HTML", reply_markup=kb)
 
 
-# ── Шаг 8: Канал ──
+# ── Шаг 8: Выбор канала (кнопкой) ──
+@router.callback_query(PostState.waiting_channel, F.data.startswith("postch:"))
+async def post_channel_select(call: types.CallbackQuery, state: FSMContext):
+    role = await get_role(call.from_user.id)
+    if role < 1:
+        return await call.answer("⛔ Недостаточно прав.", show_alert=True)
+
+    try:
+        cid = int(call.data.split(":", 1)[1])
+    except ValueError:
+        return await call.answer("❌ Некорректный канал.", show_alert=True)
+
+    # Защита: не-владелец может выбрать только qwitux cracks
+    if call.from_user.id != OWNER_ID and cid != QWITUX_CHANNEL_ID:
+        return await call.answer(
+            "⛔ Вам доступен только канал qwitux cracks.", show_alert=True
+        )
+
+    # Определяем название канала для предпросмотра
+    channel_name = None
+    if cid == QWITUX_CHANNEL_ID:
+        channel_name = QWITUX_CHANNEL_TITLE
+    else:
+        for ch in await get_all_channels():
+            if ch.get("chat_id") == cid:
+                channel_name = ch.get("title")
+                break
+
+    await state.update_data(target_channel=cid, target_channel_name=channel_name)
+    await state.set_state(PostState.confirm)
+
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
+    data = await state.get_data()
+    await send_post_preview(call.message, data)
+    await call.answer()
+
+
+# ── Шаг 8: Канал вручную (только владелец) ──
 @router.message(PostState.waiting_channel)
 async def post_channel(msg: types.Message, state: FSMContext):
     if msg.text and msg.text.startswith("/"):
         return
+
+    if msg.from_user.id != OWNER_ID:
+        return await msg.answer("👆 Выберите канал из списка кнопкой выше.")
+
     text = (msg.text or "").strip()
     try:
         target_channel = int(text)
     except ValueError:
         return await msg.answer(
-            "❌ ID канала должен быть числом.\n<i>Пример:</i> <code>-100123456789</code>",
+            "❌ Выберите канал кнопкой выше или отправьте ID числом.\n"
+            "<i>Пример:</i> <code>-100123456789</code>",
             parse_mode="HTML",
         )
 
-    await state.update_data(target_channel=target_channel)
-
-    data = await state.get_data()
-    post_text = build_post_text(data)
-
-    preview = (
-        f"👀 <b>Предпросмотр поста:</b>\n\n"
-        f"{'─' * 30}\n\n"
-        f"{post_text}\n\n"
-        f"{'─' * 30}\n\n"
-        f"📢 Канал: <code>{target_channel}</code>\n"
-        f"🖼 Медиа: {'✅ Есть' if data.get('media_type') else '❌ Нет'}\n"
-        f"📥 Ссылок: <b>{len(data.get('download_buttons', []))}</b>"
-    )
-
-    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Отправить", callback_data="post_confirm"),
-            InlineKeyboardButton(text="❌ Отменить", callback_data="post_cancel"),
-        ],
-        [
-            InlineKeyboardButton(text="👀 Тест (себе)", callback_data="post_test"),
-        ],
-    ])
-
+    await state.update_data(target_channel=target_channel, target_channel_name=None)
     await state.set_state(PostState.confirm)
 
-    media_type = data.get("media_type")
-    media_id = data.get("media_id")
-
-    if media_type == "photo" and media_id:
-        try:
-            await msg.answer_photo(
-                photo=media_id, caption=preview,
-                parse_mode="HTML", reply_markup=confirm_kb,
-            )
-            return
-        except Exception:
-            pass
-    elif media_type == "video" and media_id:
-        try:
-            await msg.answer_video(
-                video=media_id, caption=preview,
-                parse_mode="HTML", reply_markup=confirm_kb,
-            )
-            return
-        except Exception:
-            pass
-
-    await msg.answer(preview, parse_mode="HTML", reply_markup=confirm_kb)
+    data = await state.get_data()
+    await send_post_preview(msg, data)
 
 
 # ── Подтверждение ──
@@ -924,6 +1068,13 @@ async def post_confirm_handler(call: types.CallbackQuery, state: FSMContext):
                 chat_id=target_channel, text=post_text,
                 parse_mode="HTML", disable_web_page_preview=True,
             )
+
+        # Запоминаем канал (бот в нём админ) для списка выбора
+        try:
+            chat = await bot.get_chat(target_channel)
+            await save_channel(target_channel, chat.title or str(target_channel))
+        except Exception:
+            pass
 
         await call.message.edit_reply_markup(reply_markup=None)
         await call.message.answer(
@@ -1704,8 +1855,15 @@ async def on_startup(**kwargs):
         "Authorization": f"Bearer {SUPA_KEY}",
         "Content-Type": "application/json",
     })
-    await bot.set_webhook(f"{BASE_URL}{WH_PATH}")
+    await bot.set_webhook(
+        f"{BASE_URL}{WH_PATH}",
+        allowed_updates=dp.resolve_used_update_types(),
+    )
     await setup_commands()
+    try:
+        await save_channel(QWITUX_CHANNEL_ID, QWITUX_CHANNEL_TITLE)
+    except Exception:
+        pass
     logging.info("Webhook set, commands set, Supabase connected")
 
 
